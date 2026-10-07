@@ -29,9 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolver, and the default policy while the server runs. Rules are swapped
   atomically and read lock-free; clones of a filter share them.
 - `default_deny` to reject IPs outside the allow lists even before any list is set.
+- `refresh` feature: `refresh::Refresh` reloads a named block list, allow list
+  or trusted proxy ranges on an interval from a file or a custom loader, and
+  `fetch` adds an HTTPS source. A refresh is applied only when it loads, parses,
+  is non-empty and passes `Safeguards` (size, address coverage, sudden shrink or
+  growth); otherwise the list in use is kept. The HTTPS source is https-only and
+  follows redirects only to the same host.
 - `IpFilter::check`, `resolve` and `resolve_parts` for use outside the middleware.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.
 
-Requires ipware 0.5.
+Requires ipware 0.5 with `IpRanges` address counts (from git until the next ipware release).

@@ -21,6 +21,12 @@
 //! axum-ipware = { version = "0.1", features = ["providers"] }
 //! ```
 //!
+//! | Feature | Adds |
+//! | --- | --- |
+//! | `providers` | platform presets and provider IP ranges from ipware |
+//! | `refresh` | lists kept up to date from files or custom loaders |
+//! | `fetch` | an HTTPS source for `refresh`, built on reqwest with rustls |
+//!
 //! ## 🔧 Example
 //!
 //! ```rust,no_run
@@ -56,7 +62,7 @@
 //! ## 🤝 Behind a proxy
 //!
 //! The client IP is resolved by ipware's
-//! [`ClientIpResolver`](ipware::ClientIpResolver). Proxy headers are only read when
+//! [`ClientIpResolver`]. Proxy headers are only read when
 //! the TCP peer is one of your trusted proxies, so a client that reaches the app
 //! directly cannot bypass the rules by sending its own headers.
 //!
@@ -79,7 +85,7 @@
 //! # }
 //! ```
 //!
-//! [`ClientIpStrategy`](ipware::ClientIpStrategy) also covers a fixed proxy count,
+//! [`ClientIpStrategy`] also covers a fixed proxy count,
 //! the rightmost public address, single-IP CDN headers such as `CF-Connecting-IP`,
 //! RFC 7239 `Forwarded`, ipware's own header lookup, and chains of these. Without a
 //! resolver, the filter uses the peer address.
@@ -134,6 +140,83 @@
 //! rules, and [`IpFilter::resolve`] / [`IpFilter::resolve_parts`] resolve a
 //! request's client IP.
 //!
+//! ## 🔁 Refreshing lists
+//!
+//! With the `refresh` feature, [`refresh::Refresh`] reloads a named list on an
+//! interval from a file, an HTTPS URL (`fetch` feature) or your own async loader:
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "fetch")] {
+//! use std::time::Duration;
+//!
+//! use axum_ipware::refresh::{Refresh, Source};
+//! use axum_ipware::IpFilter;
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let filter = IpFilter::new();
+//! let tor = Refresh::block_list(&filter.handle(), "tor")
+//!     .source(Source::https("https://check.torproject.org/torbulkexitlist")?)
+//!     .every(Duration::from_secs(60 * 60))
+//!     .spawn();
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! Whoever controls a list's source controls what it allows, so a refresh is
+//! applied only when it passes every check, and the list in use is kept otherwise:
+//!
+//! - Failed loads, oversized responses, parse errors and empty lists never
+//!   replace the current list.
+//! - Safeguards cap the size and the number of addresses a list may cover, and
+//!   reject sudden shrinking or growth; allow lists and trusted proxies get
+//!   stricter limits than block lists.
+//! - Allow lists and trusted proxies are only refreshed through their own
+//!   constructors, `Refresh::allow_list` and `Refresh::trusted_proxies`.
+//! - The HTTPS source only accepts `https://` URLs, follows redirects only to the
+//!   same host, and times out after 30 seconds.
+//!
+//! ### Safeguards
+//!
+//! Every refresh is checked against `refresh::Safeguards` before it is applied.
+//! Each list type starts from its own defaults, so lists are protected without
+//! extra configuration:
+//!
+//! | Limit | Checks | Block lists | Allow lists and trusted proxies |
+//! | --- | --- | --- | --- |
+//! | `max_bytes` | size of the response or file | 32 MiB | 4 MiB |
+//! | `max_ipv4_addresses` | IPv4 addresses the list may cover | 2²⁸ (a `/4`) | 2²⁴ (a `/8`) |
+//! | `max_ipv6_addresses` | IPv6 addresses the list may cover | 2¹¹² (a `/16`) | 2⁹⁶ (a `/32`) |
+//! | `max_shrink` | how much smaller than the last applied list | half | half |
+//! | `max_growth` | how many times larger than the last applied list | no limit | double |
+//!
+//! Adjust them when a list legitimately needs more room, such as a large
+//! blocklist or one that changes a lot between refreshes. `None` disables the
+//! shrink or growth check:
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "refresh")] {
+//! use axum_ipware::refresh::{Refresh, Safeguards, Source};
+//! use axum_ipware::IpFilter;
+//!
+//! let filter = IpFilter::new();
+//! let blocklist = Refresh::block_list(&filter.handle(), "blocklist")
+//!     .source(Source::file("/etc/myapp/blocklist.txt"))
+//!     .safeguards(
+//!         Safeguards::for_block_lists()
+//!             .max_bytes(64 << 20)   // accept up to 64 MiB
+//!             .max_shrink(Some(0.8)) // allow losing up to 80% at once
+//!             .max_growth(Some(3.0)), // reject more than tripling
+//!     );
+//! # }
+//! ```
+//!
+//! Loosening the limits of allow lists and trusted proxies lets whoever controls
+//! the source admit more addresses, so only do it for sources you trust.
+//!
+//! The `fetch` feature's dependencies need MSRV-aware dependency resolution on Rust
+//! older than 1.88, which is the default for projects on the 2024 edition.
+//!
 //! ## 🛑 Custom rejections
 //!
 //! ```rust
@@ -152,10 +235,24 @@
 //! ```
 //!
 //! To filter only some routes, add the layer with
-//! [`Router::route_layer`](axum::Router::route_layer) on a nested router.
+//! [`Router::route_layer`] on a nested router.
+//!
+//! [`ClientIpResolver`]: https://docs.rs/ipware/latest/ipware/struct.ClientIpResolver.html
+//! [`ClientIpStrategy`]: https://docs.rs/ipware/latest/ipware/enum.ClientIpStrategy.html
+//! [`Router::route_layer`]: https://docs.rs/axum/latest/axum/struct.Router.html#method.route_layer
+//! [`IpFilter::allow_ranges`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.allow_ranges
+//! [`IpFilter::block_ranges`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.block_ranges
+//! [`IpFilter::check`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.check
+//! [`IpFilter::handle`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.handle
+//! [`IpFilter::resolve`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.resolve
+//! [`IpFilter::resolve_parts`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.resolve_parts
+//! [`IpFilterHandle`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilterHandle.html
+//! [`refresh::Refresh`]: https://docs.rs/axum-ipware/latest/axum_ipware/refresh/struct.Refresh.html
 
 mod client_ip;
 mod filter;
+#[cfg(feature = "refresh")]
+pub mod refresh;
 
 pub use client_ip::{ClientIp, MissingClientIp};
 pub use filter::{IpFilter, IpFilterHandle, IpFilterService, RejectReason, Rejection};

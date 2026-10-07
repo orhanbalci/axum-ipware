@@ -21,6 +21,10 @@ jobs:
             features: ""
           - name: providers
             features: --features providers
+          - name: refresh
+            features: --features refresh
+          - name: all features
+            features: --all-features
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -53,4 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
+      # Pick dependency versions that support the declared rust-version.
       - run: cargo check --all-features --lib
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback

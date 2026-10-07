@@ -15,19 +15,25 @@ exclude = [".github", "rustfmt.toml"]
 [features]
 # ipware's platform presets and provider IP ranges
 providers = ["ipware/providers"]
+# Keep lists up to date from files or custom loaders
+refresh = ["dep:tokio"]
+# HTTPS source for `refresh`, built on reqwest with rustls
+fetch = ["refresh", "dep:reqwest"]
 
 [dependencies]
 arc-swap = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
-ipware = "0.5"
+ipware = { version = "0.5", git = "https://github.com/orhanbalci/ipware.git", rev = "cfc6a6685b944b0463927f18755914d94ad22939" }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+tokio = { version = "1", features = ["fs", "rt", "time"], optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [package.metadata.docs.rs]
