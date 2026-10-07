@@ -24,6 +24,7 @@
 //! | Feature | Adds |
 //! | --- | --- |
 //! | `providers` | platform presets and provider IP ranges from ipware |
+//! | `glob` | glob patterns such as `192.168.1.*` in lists and rules |
 //! | `refresh` | lists kept up to date from files or custom loaders |
 //! | `fetch` | an HTTPS source for `refresh`, built on reqwest with rustls |
 //!
@@ -115,6 +116,53 @@
 //! their date and for parsers to load fresh lists, which you can pass to
 //! [`IpFilter::allow_ranges`] and [`IpFilter::block_ranges`].
 //!
+//! ## 📜 Ordered rules
+//!
+//! Besides allow and block lists, [`IpFilter::rules`] takes nginx-style rules that
+//! are checked first; the first matching rule decides, and when none matches the
+//! lists decide. Rules can be written in code or parsed from text, e.g. a config
+//! file:
+//!
+//! ```rust
+//! use axum_ipware::{parse_rules, IpFilter, Rule};
+//!
+//! let filter = IpFilter::new().rules(
+//!     parse_rules(
+//!         "deny 10.0.0.13;
+//!          allow 10.0.0.0/8;
+//!          deny all;",
+//!     )
+//!     .unwrap(),
+//! );
+//! // Equivalent in code:
+//! let same = IpFilter::new().rules([
+//!     Rule::parse("deny 10.0.0.13").unwrap(),
+//!     Rule::parse("allow 10.0.0.0/8").unwrap(),
+//!     Rule::deny_all(),
+//! ]);
+//! ```
+//!
+//! With the `glob` feature, lists and rules also accept patterns such as
+//! `192.168.1.*`, to ease migrating from glob-based filters. Patterns match the
+//! address text, so prefer CIDR ranges where possible.
+//!
+//! ## 📈 Observability
+//!
+//! [`IpFilter::on_allow`] runs for every request let through and
+//! [`IpFilter::on_block`] builds the response for rejected ones; both see the
+//! client IP, method and URI. [`IpFilter::stats`] counts requests by outcome, and
+//! every rejection is logged with `tracing` at debug level.
+//!
+//! ```rust
+//! use axum_ipware::IpFilter;
+//!
+//! let filter = IpFilter::new().on_allow(|allowed| {
+//!     tracing::info!(ip = ?allowed.client_ip, uri = %allowed.uri, "allowed");
+//! });
+//! let stats = filter.stats();
+//! println!("{} allowed, {} blocked", stats.allowed, stats.blocked);
+//! ```
+//!
 //! ## 🔄 Live updates
 //!
 //! Rules can change while the server runs. [`IpFilter::handle`] returns an
@@ -155,7 +203,9 @@
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let filter = IpFilter::new();
 //! let tor = Refresh::block_list(&filter.handle(), "tor")
-//!     .source(Source::https("https://check.torproject.org/torbulkexitlist")?)
+//!     .source(Source::https(
+//!         "https://check.torproject.org/torbulkexitlist",
+//!     )?)
 //!     .every(Duration::from_secs(60 * 60))
 //!     .spawn();
 //! # Ok(())
@@ -204,7 +254,7 @@
 //!     .source(Source::file("/etc/myapp/blocklist.txt"))
 //!     .safeguards(
 //!         Safeguards::for_block_lists()
-//!             .max_bytes(64 << 20)   // accept up to 64 MiB
+//!             .max_bytes(64 << 20) // accept up to 64 MiB
 //!             .max_shrink(Some(0.8)) // allow losing up to 80% at once
 //!             .max_growth(Some(3.0)), // reject more than tripling
 //!     );
@@ -242,6 +292,10 @@
 //! [`Router::route_layer`]: https://docs.rs/axum/latest/axum/struct.Router.html#method.route_layer
 //! [`IpFilter::allow_ranges`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.allow_ranges
 //! [`IpFilter::block_ranges`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.block_ranges
+//! [`IpFilter::rules`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.rules
+//! [`IpFilter::on_allow`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.on_allow
+//! [`IpFilter::on_block`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.on_block
+//! [`IpFilter::stats`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.stats
 //! [`IpFilter::check`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.check
 //! [`IpFilter::handle`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.handle
 //! [`IpFilter::resolve`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.resolve
@@ -253,8 +307,20 @@ mod client_ip;
 mod filter;
 #[cfg(feature = "refresh")]
 pub mod refresh;
+mod rules;
 
 pub use client_ip::{ClientIp, MissingClientIp};
-pub use filter::{IpFilter, IpFilterHandle, IpFilterService, RejectReason, Rejection};
+pub use filter::{
+    Allowed,
+    FilterStats,
+    IpFilter,
+    IpFilterHandle,
+    IpFilterService,
+    RejectReason,
+    Rejection,
+};
 pub use ipware;
 pub use ipware::IpSource;
+#[cfg(feature = "glob")]
+pub use rules::PatternError;
+pub use rules::{parse_rules, Action, Rule, RuleParseError};

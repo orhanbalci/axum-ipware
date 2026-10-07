@@ -424,3 +424,144 @@ mod live_updates {
         }
     }
 }
+
+mod filter_api {
+    use std::sync::{Arc, Mutex};
+
+    use axum_ipware::{parse_rules, Allowed, FilterStats, Rule};
+
+    use super::*;
+
+    async fn status(filter: &IpFilter, peer: &str) -> StatusCode {
+        send(app(filter.clone(), Some(peer)), None).await.0
+    }
+
+    #[tokio::test]
+    async fn ordered_rules_first_match_wins() {
+        let filter = IpFilter::new()
+            .rules(
+                parse_rules(
+                    "deny 10.0.0.13;
+                     allow 10.0.0.0/8;
+                     deny all;",
+                )
+                .unwrap(),
+            )
+            .block(["10.1.2.3"])
+            .unwrap();
+        assert_eq!(status(&filter, "10.0.0.13").await, StatusCode::FORBIDDEN);
+        // An ordered allow decides before the block lists.
+        assert_eq!(status(&filter, "10.1.2.3").await, StatusCode::OK);
+        assert_eq!(status(&filter, "192.0.2.1").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            filter.check("192.0.2.1".parse().unwrap()),
+            Err(RejectReason::DeniedByRule)
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_fall_through_to_lists() {
+        let filter = IpFilter::new()
+            .rules([Rule::deny(IpRanges::parse(["203.0.113.0/24"]).unwrap())])
+            .allow(["192.0.2.0/24"])
+            .unwrap();
+        assert_eq!(status(&filter, "203.0.113.9").await, StatusCode::FORBIDDEN);
+        assert_eq!(status(&filter, "192.0.2.9").await, StatusCode::OK);
+        assert_eq!(status(&filter, "198.51.100.9").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            filter.check("198.51.100.9".parse().unwrap()),
+            Err(RejectReason::NotAllowed)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_replaces_rules() {
+        let filter = IpFilter::new();
+        let handle = filter.handle();
+        assert_eq!(status(&filter, "192.0.2.1").await, StatusCode::OK);
+        handle.set_rules([Rule::deny_all()]);
+        assert_eq!(status(&filter, "192.0.2.1").await, StatusCode::FORBIDDEN);
+        handle.set_rules([]);
+        assert_eq!(status(&filter, "192.0.2.1").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn on_allow_and_on_block_see_the_request() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        let filter = IpFilter::new()
+            .block(["203.0.113.9"])
+            .unwrap()
+            .on_allow(move |allowed: &Allowed<'_>| {
+                let ip = allowed.client_ip.map(|client_ip| client_ip.ip.to_string());
+                log.lock().unwrap().push(format!(
+                    "{} {} {}",
+                    allowed.method,
+                    allowed.uri,
+                    ip.unwrap_or_default()
+                ));
+            })
+            .on_block(|rejection| {
+                assert_eq!(rejection.method, axum::http::Method::GET);
+                rejection.clone().into_response()
+            });
+        assert_eq!(status(&filter, "192.0.2.1").await, StatusCode::OK);
+        assert_eq!(status(&filter, "203.0.113.9").await, StatusCode::FORBIDDEN);
+        assert_eq!(*seen.lock().unwrap(), vec!["GET / 192.0.2.1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn stats_count_outcomes() {
+        let filter = IpFilter::new()
+            .rules([Rule::parse("deny 198.51.100.0/24").unwrap()])
+            .allow(["192.0.2.0/24"])
+            .unwrap()
+            .block(["192.0.2.13"])
+            .unwrap();
+        for peer in [
+            "192.0.2.1",
+            "192.0.2.2",
+            "192.0.2.13",
+            "203.0.113.1",
+            "198.51.100.1",
+        ] {
+            status(&filter, peer).await;
+        }
+        send(app(filter.clone(), None), None).await;
+        let stats = filter.handle().stats();
+        assert_eq!(stats, filter.stats());
+        let expected = (2, 1, 1, 1, 1);
+        assert_eq!(
+            (
+                stats.allowed,
+                stats.blocked,
+                stats.not_allowed,
+                stats.denied_by_rule,
+                stats.unresolved
+            ),
+            expected
+        );
+        assert_ne!(stats, FilterStats::default());
+    }
+
+    #[cfg(feature = "glob")]
+    #[tokio::test]
+    async fn glob_patterns() {
+        let filter = IpFilter::new()
+            .allow_patterns(["192.168.1.*", "10.?.0.1"])
+            .unwrap()
+            .block_patterns(["192.168.1.13"])
+            .unwrap();
+        assert_eq!(status(&filter, "192.168.1.200").await, StatusCode::OK);
+        assert_eq!(status(&filter, "10.5.0.1").await, StatusCode::OK);
+        assert_eq!(status(&filter, "10.55.0.1").await, StatusCode::FORBIDDEN);
+        assert_eq!(status(&filter, "192.168.1.13").await, StatusCode::FORBIDDEN);
+        assert_eq!(status(&filter, "192.168.10.1").await, StatusCode::FORBIDDEN);
+        assert!(IpFilter::new().allow_patterns(["192.168.1.x"]).is_err());
+
+        let rules =
+            IpFilter::new().rules([Rule::deny_pattern("172.16.*").unwrap(), Rule::allow_all()]);
+        assert_eq!(status(&rules, "172.16.5.5").await, StatusCode::FORBIDDEN);
+        assert_eq!(status(&rules, "172.17.5.5").await, StatusCode::OK);
+    }
+}

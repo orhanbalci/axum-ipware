@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -8,7 +9,7 @@ use arc_swap::ArcSwap;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::extract::ConnectInfo;
 use axum::http::request::Parts;
-use axum::http::{Extensions, HeaderMap, Request, StatusCode, Uri};
+use axum::http::{Extensions, HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::{self, Either, Ready};
 use ipware::{ClientIpResolver, IpRangeError, IpRanges};
@@ -16,8 +17,10 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::client_ip::ClientIp;
+use crate::rules::{Action, Matcher, Rule};
 
 type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
+type AllowHandler = Arc<dyn Fn(&Allowed<'_>) + Send + Sync>;
 
 /// IP filtering middleware for axum.
 ///
@@ -36,9 +39,10 @@ type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 ///
 /// # Rules
 ///
-/// A request is rejected when its IP is in a block list, or when it is in no
-/// allow list and either an allow list is set or [`default_deny`](Self::default_deny)
-/// is on. Block lists win over allow lists. When rules are configured and no IP
+/// Ordered [`rules`](Self::rules) are checked first, and the first one that
+/// matches decides. Otherwise a request is rejected when its IP is in a block
+/// list, or when it is in no allow list and either an allow list is set or
+/// [`default_deny`](Self::default_deny) is on. Block lists win over allow lists. When rules are configured and no IP
 /// can be resolved, the request is rejected. Allowing an empty set of ranges
 /// rejects every request, so a provider list that unexpectedly comes back empty
 /// fails closed.
@@ -51,27 +55,39 @@ type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 #[derive(Clone)]
 pub struct IpFilter {
     rules: Arc<ArcSwap<Rules>>,
+    counters: Arc<Counters>,
 }
 
 #[derive(Clone)]
 struct Rules {
     resolver: ClientIpResolver,
+    ordered: Vec<Rule>,
     allow: Vec<RuleList>,
     block: Vec<RuleList>,
     default_deny: bool,
     on_block: Option<BlockHandler>,
+    on_allow: Option<AllowHandler>,
 }
 
-/// A set of ranges, optionally named so it can be replaced or removed later.
+/// A set of addresses, optionally named so it can be replaced or removed later.
 #[derive(Clone, Debug)]
 struct RuleList {
     name: Option<Cow<'static, str>>,
-    ranges: Arc<IpRanges>,
+    matcher: Matcher,
+}
+
+impl RuleList {
+    fn ranges(name: Option<Cow<'static, str>>, ranges: IpRanges) -> Self {
+        RuleList { name, matcher: Matcher::Ranges(Arc::new(ranges)) }
+    }
 }
 
 impl Rules {
     fn has_rules(&self) -> bool {
-        self.default_deny || !self.allow.is_empty() || !self.block.is_empty()
+        self.default_deny
+            || !self.ordered.is_empty()
+            || !self.allow.is_empty()
+            || !self.block.is_empty()
     }
 
     fn check(&self, ip: Option<IpAddr>) -> Result<(), RejectReason> {
@@ -81,10 +97,24 @@ impl Rules {
         let Some(ip) = ip else {
             return Err(RejectReason::Unresolved);
         };
-        if self.block.iter().any(|list| list.ranges.contains(ip)) {
+        let mut text = None;
+        if let Some(rule) = self.ordered.iter().find(|rule| rule.matches(ip, &mut text)) {
+            return match rule.action() {
+                Action::Allow => Ok(()),
+                Action::Deny => Err(RejectReason::DeniedByRule),
+            };
+        }
+        if self
+            .block
+            .iter()
+            .any(|list| list.matcher.matches(ip, &mut text))
+        {
             return Err(RejectReason::Blocked);
         }
-        let allowed = self.allow.iter().any(|list| list.ranges.contains(ip));
+        let allowed = self
+            .allow
+            .iter()
+            .any(|list| list.matcher.matches(ip, &mut text));
         if !allowed && (self.default_deny || !self.allow.is_empty()) {
             return Err(RejectReason::NotAllowed);
         }
@@ -127,11 +157,14 @@ impl IpFilter {
         IpFilter {
             rules: Arc::new(ArcSwap::from_pointee(Rules {
                 resolver: ClientIpResolver::default(),
+                ordered: Vec::new(),
                 allow: Vec::new(),
                 block: Vec::new(),
                 default_deny: false,
                 on_block: None,
+                on_allow: None,
             })),
+            counters: Arc::new(Counters::default()),
         }
     }
 
@@ -189,12 +222,26 @@ impl IpFilter {
     /// # }
     /// ```
     pub fn allow_ranges(self, ranges: IpRanges) -> Self {
-        let ranges = Arc::new(ranges);
-        self.update(|rules| {
-            rules
-                .allow
-                .push(RuleList { name: None, ranges: ranges.clone() })
-        })
+        let list = RuleList::ranges(None, ranges);
+        self.update(|rules| rules.allow.push(list.clone()))
+    }
+
+    /// Adds glob patterns such as `192.168.1.*` to the allow list. Requires the
+    /// `glob` feature.
+    ///
+    /// Patterns match the IP's text form, so `10.0.0.1*` also matches
+    /// `10.0.0.100`; prefer CIDR ranges where possible.
+    #[cfg(feature = "glob")]
+    pub fn allow_patterns<I, P>(self, patterns: I) -> Result<Self, crate::PatternError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<str>,
+    {
+        let list = RuleList {
+            name: None,
+            matcher: crate::rules::patterns(patterns)?,
+        };
+        Ok(self.update(|rules| rules.allow.push(list.clone())))
     }
 
     /// Adds a named set of ranges to the allow list, replacing a list with the
@@ -216,12 +263,30 @@ impl IpFilter {
     /// Adds a parsed set of ranges to the block list, such as a blocklist
     /// fetched at startup.
     pub fn block_ranges(self, ranges: IpRanges) -> Self {
-        let ranges = Arc::new(ranges);
-        self.update(|rules| {
-            rules
-                .block
-                .push(RuleList { name: None, ranges: ranges.clone() })
-        })
+        let list = RuleList::ranges(None, ranges);
+        self.update(|rules| rules.block.push(list.clone()))
+    }
+
+    /// Adds glob patterns such as `192.168.1.*` to the block list. Requires the
+    /// `glob` feature.
+    #[cfg(feature = "glob")]
+    pub fn block_patterns<I, P>(self, patterns: I) -> Result<Self, crate::PatternError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<str>,
+    {
+        let list = RuleList {
+            name: None,
+            matcher: crate::rules::patterns(patterns)?,
+        };
+        Ok(self.update(|rules| rules.block.push(list.clone())))
+    }
+
+    /// Sets ordered nginx-style rules, checked before the allow and block lists;
+    /// the first matching rule decides. See [`Rule`].
+    pub fn rules(self, ordered: impl IntoIterator<Item = Rule>) -> Self {
+        let ordered: Vec<Rule> = ordered.into_iter().collect();
+        self.update(|rules| rules.ordered = ordered.clone())
     }
 
     /// Adds a named set of ranges to the block list, replacing a list with the
@@ -250,6 +315,21 @@ impl IpFilter {
         self.update(|rules| rules.on_block = Some(handler.clone()))
     }
 
+    /// Calls `handler` for every request the filter lets through, e.g. for
+    /// logging or metrics.
+    pub fn on_allow<F>(self, handler: F) -> Self
+    where
+        F: Fn(&Allowed<'_>) + Send + Sync + 'static,
+    {
+        let handler: AllowHandler = Arc::new(handler);
+        self.update(|rules| rules.on_allow = Some(handler.clone()))
+    }
+
+    /// Request counts since the filter was created, shared by every clone.
+    pub fn stats(&self) -> FilterStats {
+        self.counters.snapshot()
+    }
+
     /// Returns a handle that changes this filter's rules while the server runs.
     ///
     /// ```rust
@@ -264,7 +344,10 @@ impl IpFilter {
     /// handle.set_allow_list("office", IpRanges::parse(["192.0.2.0/24"]).unwrap());
     /// ```
     pub fn handle(&self) -> IpFilterHandle {
-        IpFilterHandle { rules: self.rules.clone() }
+        IpFilterHandle {
+            rules: self.rules.clone(),
+            counters: self.counters.clone(),
+        }
     }
 
     /// Resolves the client IP of a request, without applying the rules.
@@ -313,12 +396,13 @@ fn update(rules: &ArcSwap<Rules>, mut f: impl FnMut(&mut Rules)) {
 #[derive(Clone)]
 pub struct IpFilterHandle {
     rules: Arc<ArcSwap<Rules>>,
+    counters: Arc<Counters>,
 }
 
 impl IpFilterHandle {
     /// Sets the allow list called `name`, replacing a list with the same name.
     pub fn set_allow_list(&self, name: impl Into<Cow<'static, str>>, ranges: IpRanges) {
-        let list = RuleList { name: Some(name.into()), ranges: Arc::new(ranges) };
+        let list = RuleList::ranges(Some(name.into()), ranges);
         update(&self.rules, |rules| {
             set_list(&mut rules.allow, list.clone())
         });
@@ -335,7 +419,7 @@ impl IpFilterHandle {
 
     /// Sets the block list called `name`, replacing a list with the same name.
     pub fn set_block_list(&self, name: impl Into<Cow<'static, str>>, ranges: IpRanges) {
-        let list = RuleList { name: Some(name.into()), ranges: Arc::new(ranges) };
+        let list = RuleList::ranges(Some(name.into()), ranges);
         update(&self.rules, |rules| {
             set_list(&mut rules.block, list.clone())
         });
@@ -358,6 +442,17 @@ impl IpFilterHandle {
     /// Changes [`IpFilter::default_deny`].
     pub fn set_default_deny(&self, deny: bool) {
         update(&self.rules, |rules| rules.default_deny = deny);
+    }
+
+    /// Replaces the ordered rules set with [`IpFilter::rules`].
+    pub fn set_rules(&self, ordered: impl IntoIterator<Item = Rule>) {
+        let ordered: Vec<Rule> = ordered.into_iter().collect();
+        update(&self.rules, |rules| rules.ordered = ordered.clone());
+    }
+
+    /// Request counts of the filter, as [`IpFilter::stats`].
+    pub fn stats(&self) -> FilterStats {
+        self.counters.snapshot()
     }
 }
 
@@ -398,10 +493,13 @@ impl fmt::Debug for IpFilter {
         let rules = self.rules.load();
         f.debug_struct("IpFilter")
             .field("resolver", &rules.resolver)
+            .field("rules", &rules.ordered)
             .field("allow", &rules.allow)
             .field("block", &rules.block)
             .field("default_deny", &rules.default_deny)
             .field("on_block", &rules.on_block.is_some())
+            .field("on_allow", &rules.on_allow.is_some())
+            .field("stats", &self.counters.snapshot())
             .finish()
     }
 }
@@ -438,8 +536,18 @@ where
         let rules = self.filter.rules.load();
         let client_ip = rules.resolve(req.headers(), req.extensions());
         if let Err(reason) = rules.check(client_ip.map(|client_ip| client_ip.ip)) {
-            let rejection = Rejection { client_ip, reason, uri: req.uri().clone() };
+            self.filter.counters.record(Err(reason));
+            let rejection = Rejection {
+                client_ip,
+                reason,
+                method: req.method().clone(),
+                uri: req.uri().clone(),
+            };
             return Either::Left(future::ready(Ok(reject(&rules, rejection))));
+        }
+        self.filter.counters.record(Ok(()));
+        if let Some(handler) = &rules.on_allow {
+            handler(&Allowed { client_ip, method: req.method(), uri: req.uri() });
         }
         drop(rules);
         if let Some(client_ip) = client_ip {
@@ -457,8 +565,70 @@ pub struct Rejection {
     pub client_ip: Option<ClientIp>,
     /// Why the request was rejected.
     pub reason: RejectReason,
+    /// The request method.
+    pub method: Method,
     /// The request URI.
     pub uri: Uri,
+}
+
+/// A request let through by [`IpFilter`], passed to [`IpFilter::on_allow`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Allowed<'a> {
+    /// The resolved client IP, if any.
+    pub client_ip: Option<ClientIp>,
+    /// The request method.
+    pub method: &'a Method,
+    /// The request URI.
+    pub uri: &'a Uri,
+}
+
+/// Request counts of an [`IpFilter`], from [`IpFilter::stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct FilterStats {
+    /// Requests let through.
+    pub allowed: u64,
+    /// Requests rejected by a block list.
+    pub blocked: u64,
+    /// Requests rejected for not being in an allow list.
+    pub not_allowed: u64,
+    /// Requests rejected by an ordered `deny` rule.
+    pub denied_by_rule: u64,
+    /// Requests rejected because no client IP could be resolved.
+    pub unresolved: u64,
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    allowed: AtomicU64,
+    blocked: AtomicU64,
+    not_allowed: AtomicU64,
+    denied_by_rule: AtomicU64,
+    unresolved: AtomicU64,
+}
+
+impl Counters {
+    fn record(&self, outcome: Result<(), RejectReason>) {
+        let counter = match outcome {
+            Ok(()) => &self.allowed,
+            Err(RejectReason::Blocked) => &self.blocked,
+            Err(RejectReason::NotAllowed) => &self.not_allowed,
+            Err(RejectReason::DeniedByRule) => &self.denied_by_rule,
+            Err(RejectReason::Unresolved) => &self.unresolved,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> FilterStats {
+        FilterStats {
+            allowed: self.allowed.load(Ordering::Relaxed),
+            blocked: self.blocked.load(Ordering::Relaxed),
+            not_allowed: self.not_allowed.load(Ordering::Relaxed),
+            denied_by_rule: self.denied_by_rule.load(Ordering::Relaxed),
+            unresolved: self.unresolved.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Why [`IpFilter`] rejected a request.
@@ -470,6 +640,8 @@ pub enum RejectReason {
     /// The IP is in no allow list, and an allow list is set or
     /// [`default_deny`](IpFilter::default_deny) is on.
     NotAllowed,
+    /// An ordered `deny` rule matched the IP.
+    DeniedByRule,
     /// No client IP could be resolved.
     Unresolved,
 }
@@ -479,6 +651,7 @@ impl fmt::Display for RejectReason {
         f.write_str(match self {
             RejectReason::Blocked => "blocked",
             RejectReason::NotAllowed => "not allowed",
+            RejectReason::DeniedByRule => "denied by rule",
             RejectReason::Unresolved => "unresolved",
         })
     }

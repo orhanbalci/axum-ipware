@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   growth); otherwise the list in use is kept. The HTTPS source is https-only and
   follows redirects only to the same host.
 - `IpFilter::check`, `resolve` and `resolve_parts` for use outside the middleware.
+- Ordered nginx-style rules (`IpFilter::rules`, `Rule`, `parse_rules`), checked
+  before the allow and block lists; the first match decides. Rejections get
+  `RejectReason::DeniedByRule`.
+- `on_allow` hook, `IpFilter::stats` request counters, and the request method in
+  `Rejection`.
+- `glob` feature: glob patterns such as `192.168.1.*` in allow and block lists
+  and rules.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.

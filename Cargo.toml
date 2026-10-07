@@ -15,6 +15,8 @@ exclude = [".github", "rustfmt.toml"]
 [features]
 # ipware's platform presets and provider IP ranges
 providers = ["ipware/providers"]
+# Glob patterns such as `192.168.1.*` for allow/block lists and rules
+glob = []
 # Keep lists up to date from files or custom loaders
 refresh = ["dep:tokio"]
 # HTTPS source for `refresh`, built on reqwest with rustls
