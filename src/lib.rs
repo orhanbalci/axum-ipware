@@ -48,22 +48,28 @@
 //!
 //! ## 🤝 Behind a proxy
 //!
-//! Proxy headers such as `X-Forwarded-For` are only trusted when ipware can verify
-//! the proxy route. Tell it how many proxies sit in front of the app, or which ones:
+//! Proxy headers such as `X-Forwarded-For` are only read when the TCP peer is one
+//! of your proxies, and only trusted when ipware can verify the proxy route. Tell
+//! the filter where your proxies are, and ipware how many sit in front of the app:
 //!
 //! ```rust
 //! use axum_ipware::ipware::{IpWare, IpWareConfig, IpWareProxy};
 //! use axum_ipware::IpFilter;
 //!
-//! // One load balancer appends the client address to X-Forwarded-For.
-//! let filter = IpFilter::new().ipware(IpWare::new(
-//!     IpWareConfig::new(["x-forwarded-for"], true),
-//!     IpWareProxy::new(1, vec![]),
-//! ));
+//! # fn main() -> Result<(), axum_ipware::RuleError> {
+//! // One load balancer in 10.0.0.0/8 appends the client address to X-Forwarded-For.
+//! let filter = IpFilter::new()
+//!     .trusted_proxies(["10.0.0.0/8"])?
+//!     .ipware(IpWare::new(
+//!         IpWareConfig::new(["x-forwarded-for"], true),
+//!         IpWareProxy::new(1, vec![]),
+//!     ));
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! Without a verified route the filter uses the TCP peer address, so a client cannot
-//! bypass the rules by sending its own headers.
+//! Requests from any other peer use the peer address, so a client that reaches the
+//! app directly cannot bypass the rules by sending its own headers.
 //!
 //! ## 🛑 Custom rejections
 //!

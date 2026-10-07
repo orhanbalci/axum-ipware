@@ -25,12 +25,15 @@ type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 ///
 /// # Resolving the client IP
 ///
-/// The address is read from proxy headers by [`IpWare`]. A header address is only
-/// used when ipware reports a trusted route, which requires a proxy count or a
-/// trusted proxy list in its [`IpWareProxy`](ipware::IpWareProxy) config, or when
-/// [`allow_untrusted`](Self::allow_untrusted) is enabled. Otherwise the TCP peer
-/// address from [`ConnectInfo`] (or [`MockConnectInfo`] in tests) is used, so serve the app with
+/// The client IP is the TCP peer address from [`ConnectInfo`] (or [`MockConnectInfo`]
+/// in tests), so serve the app with
 /// [`into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info).
+///
+/// Proxy headers are read by [`IpWare`] only when the peer is one of the
+/// [`trusted_proxies`](Self::trusted_proxies), and the header address is used only
+/// when ipware also reports a trusted route, which requires a proxy count or a
+/// trusted proxy list in its [`IpWareProxy`](ipware::IpWareProxy) config.
+/// [`allow_untrusted`](Self::allow_untrusted) skips both checks.
 ///
 /// # Rules
 ///
@@ -47,6 +50,7 @@ struct Config {
     ipware: IpWare,
     strict: bool,
     allow_untrusted: bool,
+    trusted_proxies: IpRules,
     allow: IpRules,
     block: IpRules,
     on_block: Option<BlockHandler>,
@@ -66,6 +70,7 @@ impl IpFilter {
                 ipware: IpWare::default(),
                 strict: false,
                 allow_untrusted: false,
+                trusted_proxies: IpRules::default(),
                 allow: IpRules::default(),
                 block: IpRules::default(),
                 on_block: None,
@@ -89,13 +94,35 @@ impl IpFilter {
         self
     }
 
-    /// Uses header addresses even when ipware cannot verify the proxy route.
+    /// Uses header addresses even when the peer is not a trusted proxy or ipware
+    /// cannot verify the proxy route.
     ///
     /// Clients can set these headers themselves, so only enable this when every
     /// request reaches the app through a proxy that overwrites them. Defaults to `false`.
     pub fn allow_untrusted(mut self, allow_untrusted: bool) -> Self {
         self.config().allow_untrusted = allow_untrusted;
         self
+    }
+
+    /// Adds IP addresses or CIDR ranges of the proxies in front of the app.
+    ///
+    /// Proxy headers are only read for requests whose TCP peer is in these ranges.
+    /// Requests from other peers use the peer address, so clients that reach the
+    /// app directly cannot spoof their IP with headers.
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), axum_ipware::RuleError> {
+    /// let filter = axum_ipware::IpFilter::new().trusted_proxies(["10.0.0.0/8"])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn trusted_proxies<I, R>(mut self, rules: I) -> Result<Self, RuleError>
+    where
+        I: IntoIterator<Item = R>,
+        R: AsRef<str>,
+    {
+        self.config().trusted_proxies.extend(rules)?;
+        Ok(self)
     }
 
     /// Adds IP addresses or CIDR ranges to the allow list.
@@ -136,25 +163,18 @@ impl IpFilter {
 
     fn resolve<B>(&self, req: &Request<B>) -> Option<ClientIp> {
         let config = &self.inner;
-        let (ip, trusted_route) = config.ipware.get_client_ip(req.headers(), config.strict);
-        let header_ip = ip
-            .filter(|_| trusted_route || config.allow_untrusted)
-            .map(|ip| (ip, IpSource::Header { trusted_route }));
-        let peer_ip = || {
-            let extensions = req.extensions();
-            extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|ConnectInfo(addr)| addr)
-                .or_else(|| {
-                    extensions
-                        .get::<MockConnectInfo<SocketAddr>>()
-                        .map(|MockConnectInfo(addr)| addr)
-                })
-                .map(|addr| (addr.ip(), IpSource::Peer))
-        };
-        header_ip
-            .or_else(peer_ip)
-            .map(|(ip, source)| ClientIp { ip: ip.to_canonical(), source })
+        let peer_ip = peer_ip(req);
+        let trusted_peer = peer_ip.is_some_and(|ip| config.trusted_proxies.contains(ip));
+        if trusted_peer || config.allow_untrusted {
+            let (ip, trusted_route) = config.ipware.get_client_ip(req.headers(), config.strict);
+            if let Some(ip) = ip.filter(|_| trusted_route || config.allow_untrusted) {
+                return Some(ClientIp {
+                    ip: ip.to_canonical(),
+                    source: IpSource::Header { trusted_route },
+                });
+            }
+        }
+        peer_ip.map(|ip| ClientIp { ip, source: IpSource::Peer })
     }
 
     fn check(&self, ip: Option<IpAddr>) -> Result<(), RejectReason> {
@@ -188,6 +208,20 @@ impl IpFilter {
     }
 }
 
+/// The TCP peer address, from [`ConnectInfo`] or [`MockConnectInfo`].
+fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+    let extensions = req.extensions();
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr)
+        .or_else(|| {
+            extensions
+                .get::<MockConnectInfo<SocketAddr>>()
+                .map(|MockConnectInfo(addr)| addr)
+        })
+        .map(|addr| addr.ip().to_canonical())
+}
+
 impl fmt::Debug for IpFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let config = &self.inner;
@@ -195,6 +229,7 @@ impl fmt::Debug for IpFilter {
             .field("ipware", &config.ipware)
             .field("strict", &config.strict)
             .field("allow_untrusted", &config.allow_untrusted)
+            .field("trusted_proxies", &config.trusted_proxies)
             .field("allow", &config.allow)
             .field("block", &config.block)
             .field("on_block", &config.on_block.is_some())
