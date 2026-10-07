@@ -33,9 +33,11 @@ type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 ///
 /// # Rules
 ///
-/// A request is rejected when its IP is in the block list, or when the allow list
-/// is not empty and does not contain the IP. The block list wins over the allow list.
+/// A request is rejected when its IP is in the block list, or when an allow list
+/// was set and does not contain the IP. The block list wins over the allow list.
 /// When rules are configured and no IP can be resolved, the request is rejected.
+/// Allowing an empty set of ranges rejects every request, so a provider list that
+/// unexpectedly comes back empty fails closed.
 #[derive(Clone)]
 pub struct IpFilter {
     inner: Arc<Config>,
@@ -44,8 +46,8 @@ pub struct IpFilter {
 #[derive(Clone)]
 struct Config {
     resolver: ClientIpResolver,
-    allow: IpRanges,
-    block: IpRanges,
+    allow: Vec<IpRanges>,
+    block: Vec<IpRanges>,
     on_block: Option<BlockHandler>,
 }
 
@@ -61,8 +63,8 @@ impl IpFilter {
         IpFilter {
             inner: Arc::new(Config {
                 resolver: ClientIpResolver::default(),
-                allow: IpRanges::new(),
-                block: IpRanges::new(),
+                allow: Vec::new(),
+                block: Vec::new(),
                 on_block: None,
             }),
         }
@@ -101,23 +103,45 @@ impl IpFilter {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn allow<I, R>(mut self, ranges: I) -> Result<Self, IpRangeError>
+    pub fn allow<I, R>(self, ranges: I) -> Result<Self, IpRangeError>
     where
         I: IntoIterator<Item = R>,
         R: AsRef<str>,
     {
-        self.config().allow.extend(ranges)?;
-        Ok(self)
+        Ok(self.allow_ranges(IpRanges::parse(ranges)?))
+    }
+
+    /// Adds a parsed set of ranges to the allow list, such as a provider's
+    /// published ranges.
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "providers")] {
+    /// use axum_ipware::ipware::providers;
+    /// use axum_ipware::IpFilter;
+    ///
+    /// // Only accept GitHub webhook deliveries.
+    /// let filter = IpFilter::new().allow_ranges(providers::github_hooks());
+    /// # }
+    /// ```
+    pub fn allow_ranges(mut self, ranges: IpRanges) -> Self {
+        self.config().allow.push(ranges);
+        self
     }
 
     /// Adds IP addresses or CIDR ranges to the block list.
-    pub fn block<I, R>(mut self, ranges: I) -> Result<Self, IpRangeError>
+    pub fn block<I, R>(self, ranges: I) -> Result<Self, IpRangeError>
     where
         I: IntoIterator<Item = R>,
         R: AsRef<str>,
     {
-        self.config().block.extend(ranges)?;
-        Ok(self)
+        Ok(self.block_ranges(IpRanges::parse(ranges)?))
+    }
+
+    /// Adds a parsed set of ranges to the block list, such as a blocklist
+    /// fetched at startup.
+    pub fn block_ranges(mut self, ranges: IpRanges) -> Self {
+        self.config().block.push(ranges);
+        self
     }
 
     /// Builds the response for rejected requests. Defaults to `403 Forbidden`.
@@ -144,10 +168,10 @@ impl IpFilter {
         let Some(ip) = ip else {
             return Err(RejectReason::Unresolved);
         };
-        if config.block.contains(ip) {
+        if config.block.iter().any(|ranges| ranges.contains(ip)) {
             return Err(RejectReason::Blocked);
         }
-        if !config.allow.is_empty() && !config.allow.contains(ip) {
+        if !config.allow.is_empty() && !config.allow.iter().any(|ranges| ranges.contains(ip)) {
             return Err(RejectReason::NotAllowed);
         }
         Ok(())
@@ -235,6 +259,7 @@ where
 
 /// A request rejected by [`IpFilter`], passed to [`IpFilter::on_block`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Rejection {
     /// The resolved client IP, if any.
     pub client_ip: Option<ClientIp>,
@@ -246,6 +271,7 @@ pub struct Rejection {
 
 /// Why [`IpFilter`] rejected a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RejectReason {
     /// The IP is in the block list.
     Blocked,

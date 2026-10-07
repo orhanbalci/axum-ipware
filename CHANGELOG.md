@@ -20,8 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-Forwarded-For` and RFC 7239 `Forwarded` headers.
 - IP address and CIDR rules for IPv4 and IPv6; block rules win over allow rules.
   Requests are rejected when rules exist and no IP can be resolved.
+- `allow_ranges` and `block_ranges` for parsed `IpRanges`, such as provider
+  ranges or lists fetched at startup. An empty allow set rejects every request.
+- `providers` feature: ipware's platform presets (Cloudflare, CloudFront,
+  Fastly, Google Cloud load balancers, Fly.io) and webhook ranges.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.
 
-ipware is used from git until the release that includes `ClientIpResolver`.
+Requires ipware 0.5.

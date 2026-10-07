@@ -14,6 +14,13 @@
 //! axum-ipware = "0.1"
 //! ```
 //!
+//! Enable the `providers` feature for platform presets and the published IP
+//! ranges of CDNs, load balancers and webhook senders:
+//!
+//! ```toml
+//! axum-ipware = { version = "0.1", features = ["providers"] }
+//! ```
+//!
 //! ## 🔧 Example
 //!
 //! ```rust,no_run
@@ -76,6 +83,31 @@
 //! the rightmost public address, single-IP CDN headers such as `CF-Connecting-IP`,
 //! RFC 7239 `Forwarded`, ipware's own header lookup, and chains of these. Without a
 //! resolver, the filter uses the peer address.
+//!
+//! ## 🌐 Platform presets and webhook allow lists
+//!
+//! With the `providers` feature, ipware's presets configure the header and the
+//! proxy ranges of a CDN or hosting platform: `Cloudflare`, `CloudFront`,
+//! `Fastly`, `GoogleCloudLoadBalancer` and `FlyIo`.
+//!
+//! ```rust
+//! # #[cfg(feature = "providers")] {
+//! use axum_ipware::ipware::providers::{self, Platform};
+//! use axum_ipware::ipware::ClientIpResolver;
+//! use axum_ipware::IpFilter;
+//!
+//! // Behind Cloudflare: CF-Connecting-IP, trusted only from Cloudflare's ranges.
+//! let filter = IpFilter::new().resolver(ClientIpResolver::platform(Platform::Cloudflare));
+//!
+//! // A webhook endpoint that only accepts GitHub's delivery ranges.
+//! let webhooks = IpFilter::new().allow_ranges(providers::github_hooks());
+//! # }
+//! ```
+//!
+//! The built-in ranges are snapshots; see
+//! [`ipware::providers`](https://docs.rs/ipware/latest/ipware/providers/) for
+//! their date and for parsers to load fresh lists, which you can pass to
+//! [`IpFilter::allow_ranges`] and [`IpFilter::block_ranges`].
 //!
 //! ## 🛑 Custom rejections
 //!

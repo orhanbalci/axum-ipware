@@ -214,3 +214,78 @@ async fn extractor_without_layer_is_internal_error() {
     let (status, _) = send(app, None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+#[tokio::test]
+async fn allow_and_block_parsed_ranges() {
+    let filter = IpFilter::new()
+        .allow_ranges(IpRanges::parse(["10.0.0.0/8"]).unwrap())
+        .allow(["192.168.0.0/16"])
+        .unwrap()
+        .block_ranges(IpRanges::parse(["10.0.0.13"]).unwrap());
+    for (peer, expected) in [
+        ("10.1.2.3", StatusCode::OK),
+        ("192.168.1.1", StatusCode::OK),
+        ("10.0.0.13", StatusCode::FORBIDDEN),
+        ("172.16.0.1", StatusCode::FORBIDDEN),
+    ] {
+        let (status, _) = send(app(filter.clone(), Some(peer)), None).await;
+        assert_eq!(status, expected, "{peer}");
+    }
+}
+
+#[tokio::test]
+async fn empty_allow_set_fails_closed() {
+    let filter = IpFilter::new().allow_ranges(IpRanges::new());
+    let (status, _) = send(app(filter, Some("10.1.2.3")), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[cfg(feature = "providers")]
+mod providers {
+    use axum_ipware::ipware::providers::{self, Platform};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cloudflare_preset() {
+        let filter = IpFilter::new().resolver(ClientIpResolver::platform(Platform::Cloudflare));
+        let req = Request::builder()
+            .uri("/")
+            .header("cf-connecting-ip", "93.184.216.34")
+            .body(Body::empty())
+            .unwrap();
+        // 173.245.48.0/20 is a Cloudflare range.
+        let res = app(filter.clone(), Some("173.245.48.10"))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "header 93.184.216.34 true");
+
+        let req = Request::builder()
+            .uri("/")
+            .header("cf-connecting-ip", "93.184.216.34")
+            .body(Body::empty())
+            .unwrap();
+        let res = app(filter, Some("198.51.100.1"))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "peer 198.51.100.1");
+    }
+
+    #[tokio::test]
+    async fn github_webhook_allow_list() {
+        let filter = IpFilter::new().allow_ranges(providers::github_hooks());
+        // 140.82.112.0/20 is a GitHub hooks range.
+        let (status, _) = send(app(filter.clone(), Some("140.82.112.1")), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(app(filter, Some("93.184.216.34")), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}

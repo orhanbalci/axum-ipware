@@ -10,11 +10,16 @@ keywords = ["axum", "ip", "filter", "middleware", "proxy"]
 categories = ["web-programming::http-server", "network-programming"]
 license = "MIT"
 readme = "README.md"
+exclude = [".github", "rustfmt.toml"]
+
+[features]
+# ipware's platform presets and provider IP ranges
+providers = ["ipware/providers"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
-ipware = { version = "0.4", git = "https://github.com/orhanbalci/ipware.git", rev = "b37955d02ac07f18736bad1f30c67d1c8c6db8f7" }
+ipware = "0.5"
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"
@@ -23,3 +28,6 @@ tracing = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tower = { version = "0.5", features = ["util"] }
+
+[package.metadata.docs.rs]
+all-features = true
