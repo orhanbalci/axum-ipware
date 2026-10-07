@@ -29,6 +29,10 @@ jobs:
             features: --features governor
           - name: autoban
             features: --features autoban
+          - name: geo
+            features: --features geo
+          - name: crowdsec
+            features: --features crowdsec
           - name: all features
             features: --all-features
     steps:

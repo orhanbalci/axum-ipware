@@ -32,6 +32,8 @@ axum-ipware = { version = "0.1", features = ["providers"] }
 | `autoban` | temporary bans after too many error responses, like fail2ban |
 | `refresh` | lists kept up to date from files or custom loaders |
 | `fetch` | an HTTPS source for `refresh`, built on reqwest with rustls |
+| `geo` | country and ASN rules from MaxMind databases |
+| `crowdsec` | a CrowdSec bouncer that blocks the IPs CrowdSec bans |
 
 ### 🔧 Example
 
@@ -201,6 +203,40 @@ let app: Router = Router::new()
     .layer(GovernorLayer::new(limits))
     .layer(autoban.clone())
     .layer(IpFilter::new());
+```
+
+### 🌍 Countries, networks and CrowdSec
+
+With the `geo` feature, `geo::GeoDb` loads MaxMind databases (GeoLite2 or
+GeoIP2) for country and autonomous system rules, in lists and ordered rules.
+IPs the database does not know match no country or ASN rule.
+
+```rust
+use axum_ipware::geo::GeoDb;
+use axum_ipware::{parse_rules, IpFilter};
+
+let geo = GeoDb::new()
+    .country_database("/var/lib/GeoIP/GeoLite2-Country.mmdb")?
+    .asn_database("/var/lib/GeoIP/GeoLite2-ASN.mmdb")?;
+let filter = IpFilter::new().geo(geo).rules(parse_rules(
+    "deny country KP;
+     deny asn 64496;
+     allow all;",
+)?);
+```
+
+With the `crowdsec` feature, `crowdsec::CrowdSec` turns the filter into a
+CrowdSec bouncer: it follows the Local API's decision stream and keeps the
+banned IPs and ranges in the block list `crowdsec`.
+
+```rust
+use axum_ipware::crowdsec::CrowdSec;
+use axum_ipware::IpFilter;
+
+let filter = IpFilter::new();
+let bouncer = CrowdSec::new("http://127.0.0.1:8080", "<bouncer key>")?
+    .refresh(&filter.handle())?
+    .spawn();
 ```
 
 ### 🔄 Live updates

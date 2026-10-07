@@ -56,8 +56,8 @@ use tokio::task::JoinHandle;
 
 use crate::filter::IpFilterHandle;
 
-type BoxError = Box<dyn Error + Send + Sync>;
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
+pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type LoadFn = Arc<dyn Fn(usize) -> BoxFuture<Result<String, BoxError>> + Send + Sync>;
 type ParseFn = Arc<dyn Fn(&str) -> Result<IpRanges, BoxError> + Send + Sync>;
 
@@ -80,6 +80,13 @@ pub struct Source {
 }
 
 impl Source {
+    #[cfg(feature = "crowdsec")]
+    pub(crate) fn from_loader(
+        load: impl Fn(usize) -> BoxFuture<Result<String, BoxError>> + Send + Sync + 'static,
+    ) -> Self {
+        Source { load: Arc::new(load) }
+    }
+
     /// Loads the list with an async function, e.g. using your own HTTP client.
     ///
     /// The response size limit is checked after the function returns.
@@ -150,24 +157,33 @@ impl Source {
                 let url = parsed.clone();
                 Box::pin(async move {
                     let mut response = client.get(url).send().await?.error_for_status()?;
-                    if response
-                        .content_length()
-                        .is_some_and(|len| len > max_bytes as u64)
-                    {
-                        return Err(RefreshError::TooLarge { limit: max_bytes }.into());
-                    }
-                    let mut body = Vec::new();
-                    while let Some(chunk) = response.chunk().await? {
-                        if body.len() + chunk.len() > max_bytes {
-                            return Err(RefreshError::TooLarge { limit: max_bytes }.into());
-                        }
-                        body.extend_from_slice(&chunk);
-                    }
-                    Ok(String::from_utf8(body)?)
+                    read_capped(&mut response, max_bytes).await
                 })
             }),
         })
     }
+}
+
+/// Reads a response body as UTF-8, failing once it exceeds `max_bytes`.
+#[cfg(feature = "fetch")]
+pub(crate) async fn read_capped(
+    response: &mut reqwest::Response,
+    max_bytes: usize,
+) -> Result<String, BoxError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return Err(RefreshError::TooLarge { limit: max_bytes }.into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > max_bytes {
+            return Err(RefreshError::TooLarge { limit: max_bytes }.into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(body)?)
 }
 
 impl fmt::Debug for Source {
@@ -179,7 +195,7 @@ impl fmt::Debug for Source {
 /// Returned by [`Source::https`] for URLs that are not `https://` with a host.
 #[cfg(feature = "fetch")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidUrl(String);
+pub struct InvalidUrl(pub(crate) String);
 
 #[cfg(feature = "fetch")]
 impl fmt::Display for InvalidUrl {
@@ -202,6 +218,7 @@ pub struct Safeguards {
     max_ipv6_addresses: u128,
     max_shrink: Option<f64>,
     max_growth: Option<f64>,
+    allow_empty: bool,
 }
 
 impl Safeguards {
@@ -214,6 +231,7 @@ impl Safeguards {
             max_ipv6_addresses: 1 << 112,
             max_shrink: Some(0.5),
             max_growth: None,
+            allow_empty: false,
         }
     }
 
@@ -226,6 +244,7 @@ impl Safeguards {
             max_ipv6_addresses: 1 << 96,
             max_shrink: Some(0.5),
             max_growth: Some(2.0),
+            allow_empty: false,
         }
     }
 
@@ -261,12 +280,20 @@ impl Safeguards {
         self
     }
 
+    /// Applies empty lists instead of rejecting them, for sources where an empty
+    /// list is normal, such as a ban list once every ban has expired. An empty
+    /// allow list rejects every request.
+    pub fn allow_empty(mut self, allow: bool) -> Self {
+        self.allow_empty = allow;
+        self
+    }
+
     fn check(
         &self,
         ranges: &IpRanges,
         previous: Option<Coverage>,
     ) -> Result<Coverage, RefreshError> {
-        if ranges.is_empty() {
+        if ranges.is_empty() && !self.allow_empty {
             return Err(RefreshError::Empty);
         }
         let coverage = Coverage {
@@ -319,7 +346,7 @@ pub enum RefreshError {
     },
     /// The response could not be parsed.
     Parse(BoxError),
-    /// The list has no entries.
+    /// The list has no entries, and [`Safeguards::allow_empty`] is off.
     Empty,
     /// The list covers more addresses than the safeguards allow.
     TooBroad,

@@ -1,8 +1,68 @@
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use ipware::IpRanges;
+
+/// One request's IP, with lookups computed at most once across all rules.
+pub(crate) struct MatchContext<'a> {
+    ip: IpAddr,
+    #[cfg(feature = "glob")]
+    text: Option<String>,
+    #[cfg(feature = "geo")]
+    geo: Option<&'a crate::geo::GeoDb>,
+    #[cfg(feature = "geo")]
+    country: Option<Option<crate::geo::CountryCode>>,
+    #[cfg(feature = "geo")]
+    asn: Option<Option<u32>>,
+    _geo: PhantomData<&'a ()>,
+}
+
+impl<'a> MatchContext<'a> {
+    pub(crate) fn new(ip: IpAddr) -> Self {
+        MatchContext {
+            ip,
+            #[cfg(feature = "glob")]
+            text: None,
+            #[cfg(feature = "geo")]
+            geo: None,
+            #[cfg(feature = "geo")]
+            country: None,
+            #[cfg(feature = "geo")]
+            asn: None,
+            _geo: PhantomData,
+        }
+    }
+
+    #[cfg(feature = "geo")]
+    pub(crate) fn with_geo(mut self, geo: Option<&'a crate::geo::GeoDb>) -> Self {
+        self.geo = geo;
+        self
+    }
+
+    #[cfg(feature = "glob")]
+    fn text(&mut self) -> &str {
+        let ip = self.ip;
+        self.text.get_or_insert_with(|| ip.to_string())
+    }
+
+    #[cfg(feature = "geo")]
+    fn country(&mut self) -> Option<crate::geo::CountryCode> {
+        let (ip, geo) = (self.ip, self.geo);
+        *self
+            .country
+            .get_or_insert_with(|| geo.and_then(|geo| geo.country(ip)))
+    }
+
+    #[cfg(feature = "geo")]
+    fn asn(&mut self) -> Option<u32> {
+        let (ip, geo) = (self.ip, self.geo);
+        *self
+            .asn
+            .get_or_insert_with(|| geo.and_then(|geo| geo.asn(ip)))
+    }
+}
 
 /// What a list or rule matches.
 #[derive(Clone, Debug)]
@@ -11,20 +71,26 @@ pub(crate) enum Matcher {
     Ranges(Arc<IpRanges>),
     #[cfg(feature = "glob")]
     Patterns(Arc<[GlobPattern]>),
+    #[cfg(feature = "geo")]
+    Countries(Arc<[crate::geo::CountryCode]>),
+    #[cfg(feature = "geo")]
+    Asns(Arc<[u32]>),
 }
 
 impl Matcher {
-    /// `text` caches the IP's string form for pattern matching.
-    #[cfg_attr(not(feature = "glob"), allow(unused_variables))]
-    pub(crate) fn matches(&self, ip: IpAddr, text: &mut Option<String>) -> bool {
+    pub(crate) fn matches(&self, ctx: &mut MatchContext<'_>) -> bool {
         match self {
             Matcher::All => true,
-            Matcher::Ranges(ranges) => ranges.contains(ip),
+            Matcher::Ranges(ranges) => ranges.contains(ctx.ip),
             #[cfg(feature = "glob")]
             Matcher::Patterns(patterns) => {
-                let text = text.get_or_insert_with(|| ip.to_string());
+                let text = ctx.text();
                 patterns.iter().any(|pattern| pattern.matches(text))
             }
+            #[cfg(feature = "geo")]
+            Matcher::Countries(codes) => ctx.country().is_some_and(|code| codes.contains(&code)),
+            #[cfg(feature = "geo")]
+            Matcher::Asns(asns) => ctx.asn().is_some_and(|asn| asns.contains(&asn)),
         }
     }
 }
@@ -114,9 +180,57 @@ impl Rule {
         })
     }
 
+    /// Allows clients in these countries (ISO codes such as `"SE"`). Requires the
+    /// `geo` feature and a database set with [`IpFilter::geo`](crate::IpFilter::geo).
+    #[cfg(feature = "geo")]
+    pub fn allow_countries<I, C>(codes: I) -> Result<Self, crate::geo::InvalidCountryCode>
+    where
+        I: IntoIterator<Item = C>,
+        C: AsRef<str>,
+    {
+        let codes = crate::geo::country_codes(codes)?;
+        Ok(Rule {
+            action: Action::Allow,
+            matcher: Matcher::Countries(codes),
+        })
+    }
+
+    /// Denies clients in these countries. Requires the `geo` feature.
+    #[cfg(feature = "geo")]
+    pub fn deny_countries<I, C>(codes: I) -> Result<Self, crate::geo::InvalidCountryCode>
+    where
+        I: IntoIterator<Item = C>,
+        C: AsRef<str>,
+    {
+        let codes = crate::geo::country_codes(codes)?;
+        Ok(Rule {
+            action: Action::Deny,
+            matcher: Matcher::Countries(codes),
+        })
+    }
+
+    /// Allows clients in these autonomous systems. Requires the `geo` feature.
+    #[cfg(feature = "geo")]
+    pub fn allow_asns(asns: impl IntoIterator<Item = u32>) -> Self {
+        Rule {
+            action: Action::Allow,
+            matcher: Matcher::Asns(asns.into_iter().collect()),
+        }
+    }
+
+    /// Denies clients in these autonomous systems. Requires the `geo` feature.
+    #[cfg(feature = "geo")]
+    pub fn deny_asns(asns: impl IntoIterator<Item = u32>) -> Self {
+        Rule {
+            action: Action::Deny,
+            matcher: Matcher::Asns(asns.into_iter().collect()),
+        }
+    }
+
     /// Parses `allow <target>` or `deny <target>`, where the target is `all`, an
-    /// IP address, a CIDR range, or with the `glob` feature a pattern such as
-    /// `192.168.1.*`. A trailing `;` is accepted, as in nginx.
+    /// IP address, a CIDR range, with the `glob` feature a pattern such as
+    /// `192.168.1.*`, or with the `geo` feature `country SE,NO` or `asn 64496`.
+    /// A trailing `;` is accepted, as in nginx.
     pub fn parse(rule: &str) -> Result<Self, RuleParseError> {
         let error = |message: &str| RuleParseError { line: None, message: message.to_owned() };
         let rule = rule.trim().trim_end_matches(';').trim();
@@ -129,7 +243,31 @@ impl Rule {
             _ => return Err(error("the rule must start with `allow` or `deny`")),
         };
         let target = target.trim();
-        let matcher = if target == "all" {
+        let geo_target = target
+            .split_once(char::is_whitespace)
+            .filter(|(kind, _)| matches!(*kind, "country" | "asn"));
+        let matcher = if let Some((kind, values)) = geo_target {
+            #[cfg(feature = "geo")]
+            {
+                let values = values.split(',').map(str::trim).filter(|v| !v.is_empty());
+                if kind == "country" {
+                    Matcher::Countries(
+                        crate::geo::country_codes(values).map_err(|err| error(&err.to_string()))?,
+                    )
+                } else {
+                    let asns = values
+                        .map(|asn| asn.trim_start_matches("AS").parse::<u32>())
+                        .collect::<Result<Arc<[u32]>, _>>()
+                        .map_err(|_| error("expected AS numbers such as `asn 64496`"))?;
+                    Matcher::Asns(asns)
+                }
+            }
+            #[cfg(not(feature = "geo"))]
+            {
+                let _ = (kind, values);
+                return Err(error("country and asn rules require the `geo` feature"));
+            }
+        } else if target == "all" {
             Matcher::All
         } else if target.contains(['*', '?']) {
             #[cfg(feature = "glob")]
@@ -152,8 +290,8 @@ impl Rule {
         self.action
     }
 
-    pub(crate) fn matches(&self, ip: IpAddr, text: &mut Option<String>) -> bool {
-        self.matcher.matches(ip, text)
+    pub(crate) fn matches(&self, ctx: &mut MatchContext<'_>) -> bool {
+        self.matcher.matches(ctx)
     }
 }
 
@@ -294,15 +432,17 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn matches(rule: &Rule, s: &str) -> bool {
+        rule.matches(&mut MatchContext::new(ip(s)))
+    }
+
     #[test]
     fn parses_rules() {
         let rule = Rule::parse("  deny 10.0.0.0/8; ").unwrap();
         assert_eq!(rule.action(), Action::Deny);
-        assert!(rule.matches(ip("10.1.2.3"), &mut None));
-        assert!(!rule.matches(ip("11.1.2.3"), &mut None));
-        assert!(Rule::parse("allow all")
-            .unwrap()
-            .matches(ip("::1"), &mut None));
+        assert!(matches(&rule, "10.1.2.3"));
+        assert!(!matches(&rule, "11.1.2.3"));
+        assert!(matches(&Rule::parse("allow all").unwrap(), "::1"));
         assert!(Rule::parse("permit 10.0.0.1").is_err());
         assert!(Rule::parse("allow").is_err());
         assert!(Rule::parse("allow 10.0.0.0/33").is_err());
@@ -315,6 +455,12 @@ mod tests {
         assert!(err.to_string().starts_with("line 4:"));
     }
 
+    #[cfg(not(feature = "geo"))]
+    #[test]
+    fn geo_rules_need_geo_feature() {
+        assert!(Rule::parse("deny country RU").is_err());
+    }
+
     #[cfg(not(feature = "glob"))]
     #[test]
     fn patterns_need_glob_feature() {
@@ -324,19 +470,19 @@ mod tests {
     #[cfg(feature = "glob")]
     #[test]
     fn glob_patterns() {
-        let matches = |pattern: &str, text: &str| GlobPattern::new(pattern).unwrap().matches(text);
-        assert!(matches("192.168.1.*", "192.168.1.200"));
-        assert!(!matches("192.168.1.*", "192.168.10.1"));
-        assert!(matches("172.??.6*.12", "172.16.64.12"));
-        assert!(!matches("172.??.6*.12", "172.1.64.12"));
-        assert!(matches("*", "2001:db8::1"));
-        assert!(matches("2001:DB8::*", "2001:db8::1"));
-        assert!(matches("10.*.*.1", "10.20.30.1"));
-        assert!(!matches("10.*.*.1", "10.20.30.10"));
-        assert!(matches("1*1", "1.2.3.1"));
+        let glob = |pattern: &str, text: &str| GlobPattern::new(pattern).unwrap().matches(text);
+        assert!(glob("192.168.1.*", "192.168.1.200"));
+        assert!(!glob("192.168.1.*", "192.168.10.1"));
+        assert!(glob("172.??.6*.12", "172.16.64.12"));
+        assert!(!glob("172.??.6*.12", "172.1.64.12"));
+        assert!(glob("*", "2001:db8::1"));
+        assert!(glob("2001:DB8::*", "2001:db8::1"));
+        assert!(glob("10.*.*.1", "10.20.30.1"));
+        assert!(!glob("10.*.*.1", "10.20.30.10"));
+        assert!(glob("1*1", "1.2.3.1"));
         assert!(GlobPattern::new("192.168.1.x").is_err());
         assert!(GlobPattern::new("").is_err());
         let rule = Rule::parse("deny 192.168.1.*").unwrap();
-        assert!(rule.matches(ip("192.168.1.5"), &mut None));
+        assert!(matches(&rule, "192.168.1.5"));
     }
 }

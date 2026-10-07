@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `autoban` feature: `autoban::AutoBan`, a layer that temporarily bans clients
   after too many matching responses, with an exempt list, a cap on tracked
   clients, IPv6 prefix grouping, and manual `ban` / `unban`.
+- `geo` feature: `geo::GeoDb` for MaxMind databases, `allow_countries`,
+  `block_countries`, `allow_asns`, `block_asns`, `country` and `asn` targets in
+  ordered rules (`deny country KP`), and `IpFilterHandle::set_geo` for database
+  updates.
+- `crowdsec` feature: `crowdsec::CrowdSec`, a bouncer that follows the CrowdSec
+  Local API decision stream into the block list `crowdsec`, with a full resync
+  after errors and plain HTTP only for loopback hosts unless allowed.
+- `Safeguards::allow_empty` for sources where an empty list is normal.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.

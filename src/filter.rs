@@ -17,7 +17,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::client_ip::ClientIp;
-use crate::rules::{Action, Matcher, Rule};
+use crate::rules::{Action, MatchContext, Matcher, Rule};
 
 type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 type AllowHandler = Arc<dyn Fn(&Allowed<'_>) + Send + Sync>;
@@ -67,6 +67,8 @@ struct Rules {
     default_deny: bool,
     on_block: Option<BlockHandler>,
     on_allow: Option<AllowHandler>,
+    #[cfg(feature = "geo")]
+    geo: Option<crate::geo::GeoDb>,
 }
 
 /// A set of addresses, optionally named so it can be replaced or removed later.
@@ -97,24 +99,20 @@ impl Rules {
         let Some(ip) = ip else {
             return Err(RejectReason::Unresolved);
         };
-        let mut text = None;
-        if let Some(rule) = self.ordered.iter().find(|rule| rule.matches(ip, &mut text)) {
+        #[cfg(not(feature = "geo"))]
+        let ctx = &mut MatchContext::new(ip);
+        #[cfg(feature = "geo")]
+        let ctx = &mut MatchContext::new(ip).with_geo(self.geo.as_ref());
+        if let Some(rule) = self.ordered.iter().find(|rule| rule.matches(ctx)) {
             return match rule.action() {
                 Action::Allow => Ok(()),
                 Action::Deny => Err(RejectReason::DeniedByRule),
             };
         }
-        if self
-            .block
-            .iter()
-            .any(|list| list.matcher.matches(ip, &mut text))
-        {
+        if self.block.iter().any(|list| list.matcher.matches(ctx)) {
             return Err(RejectReason::Blocked);
         }
-        let allowed = self
-            .allow
-            .iter()
-            .any(|list| list.matcher.matches(ip, &mut text));
+        let allowed = self.allow.iter().any(|list| list.matcher.matches(ctx));
         if !allowed && (self.default_deny || !self.allow.is_empty()) {
             return Err(RejectReason::NotAllowed);
         }
@@ -163,6 +161,8 @@ impl IpFilter {
                 default_deny: false,
                 on_block: None,
                 on_allow: None,
+                #[cfg(feature = "geo")]
+                geo: None,
             })),
             counters: Arc::new(Counters::default()),
         }
@@ -280,6 +280,60 @@ impl IpFilter {
             matcher: crate::rules::patterns(patterns)?,
         };
         Ok(self.update(|rules| rules.block.push(list.clone())))
+    }
+
+    /// Sets the MaxMind databases used by country and ASN rules. Requires the
+    /// `geo` feature.
+    #[cfg(feature = "geo")]
+    pub fn geo(self, geo: crate::geo::GeoDb) -> Self {
+        self.update(|rules| rules.geo = Some(geo.clone()))
+    }
+
+    /// Adds countries (ISO codes such as `"SE"`) to the allow list. Requires the
+    /// `geo` feature and a database set with [`geo`](Self::geo).
+    #[cfg(feature = "geo")]
+    pub fn allow_countries<I, C>(self, codes: I) -> Result<Self, crate::geo::InvalidCountryCode>
+    where
+        I: IntoIterator<Item = C>,
+        C: AsRef<str>,
+    {
+        let matcher = Matcher::Countries(crate::geo::country_codes(codes)?);
+        let list = RuleList { name: None, matcher };
+        Ok(self.update(|rules| rules.allow.push(list.clone())))
+    }
+
+    /// Adds countries to the block list. Requires the `geo` feature.
+    #[cfg(feature = "geo")]
+    pub fn block_countries<I, C>(self, codes: I) -> Result<Self, crate::geo::InvalidCountryCode>
+    where
+        I: IntoIterator<Item = C>,
+        C: AsRef<str>,
+    {
+        let matcher = Matcher::Countries(crate::geo::country_codes(codes)?);
+        let list = RuleList { name: None, matcher };
+        Ok(self.update(|rules| rules.block.push(list.clone())))
+    }
+
+    /// Adds autonomous system numbers to the allow list. Requires the `geo`
+    /// feature and an ASN database.
+    #[cfg(feature = "geo")]
+    pub fn allow_asns(self, asns: impl IntoIterator<Item = u32>) -> Self {
+        let list = RuleList {
+            name: None,
+            matcher: Matcher::Asns(asns.into_iter().collect()),
+        };
+        self.update(|rules| rules.allow.push(list.clone()))
+    }
+
+    /// Adds autonomous system numbers to the block list. Requires the `geo`
+    /// feature and an ASN database.
+    #[cfg(feature = "geo")]
+    pub fn block_asns(self, asns: impl IntoIterator<Item = u32>) -> Self {
+        let list = RuleList {
+            name: None,
+            matcher: Matcher::Asns(asns.into_iter().collect()),
+        };
+        self.update(|rules| rules.block.push(list.clone()))
     }
 
     /// Sets ordered nginx-style rules, checked before the allow and block lists;
@@ -442,6 +496,13 @@ impl IpFilterHandle {
     /// Changes [`IpFilter::default_deny`].
     pub fn set_default_deny(&self, deny: bool) {
         update(&self.rules, |rules| rules.default_deny = deny);
+    }
+
+    /// Replaces the MaxMind databases, e.g. after a weekly update. Requires the
+    /// `geo` feature.
+    #[cfg(feature = "geo")]
+    pub fn set_geo(&self, geo: crate::geo::GeoDb) {
+        update(&self.rules, |rules| rules.geo = Some(geo.clone()));
     }
 
     /// Replaces the ordered rules set with [`IpFilter::rules`].
