@@ -48,57 +48,34 @@
 //!
 //! ## 🤝 Behind a proxy
 //!
-//! Proxy headers such as `X-Forwarded-For` are only read when the TCP peer is one
-//! of your proxies, and only trusted when ipware can verify the proxy route. Tell
-//! the filter where your proxies are, and ipware how many sit in front of the app:
+//! The client IP is resolved by ipware's
+//! [`ClientIpResolver`](ipware::ClientIpResolver). Proxy headers are only read when
+//! the TCP peer is one of your trusted proxies, so a client that reaches the app
+//! directly cannot bypass the rules by sending its own headers.
 //!
 //! ```rust
-//! use axum_ipware::ipware::{IpWare, IpWareConfig, IpWareProxy};
+//! use axum_ipware::ipware::{header, ClientIpResolver, ClientIpStrategy, IpRanges};
 //! use axum_ipware::IpFilter;
 //!
-//! # fn main() -> Result<(), axum_ipware::RuleError> {
-//! // One load balancer in 10.0.0.0/8 appends the client address to X-Forwarded-For.
+//! # fn main() -> Result<(), axum_ipware::ipware::IpRangeError> {
+//! // Load balancers in 10.0.0.0/8 append the client address to X-Forwarded-For.
 //! let filter = IpFilter::new()
-//!     .trusted_proxies(["10.0.0.0/8"])?
-//!     .ipware(IpWare::new(
-//!         IpWareConfig::new(["x-forwarded-for"], true),
-//!         IpWareProxy::new(1, vec![]),
-//!     ));
+//!     .resolver(
+//!         ClientIpResolver::new(ClientIpStrategy::rightmost_trusted_range(
+//!             header::X_FORWARDED_FOR,
+//!         ))
+//!         .trusted_proxies(IpRanges::parse(["10.0.0.0/8"])?)
+//!         .max_forwarded_hops(10),
+//!     )
+//!     .allow(["10.0.0.0/8", "192.168.0.0/16"])?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Requests from any other peer use the peer address, so a client that reaches the
-//! app directly cannot bypass the rules by sending its own headers.
-//!
-//! ## 🧭 Choosing a source
-//!
-//! [`ClientIpSource`] picks how the client IP is read once the peer is trusted:
-//!
-//! | Source | Use when |
-//! | --- | --- |
-//! | `Ipware` (default) | ipware's header lookup with its proxy count or proxy list |
-//! | `RightmostTrustedRange(header)` | your proxies' ranges are known; skips them from the right |
-//! | `RightmostTrustedCount(header, n)` | a fixed number of proxies sit in front of the app |
-//! | `RightmostNonPrivate(header)` | proxies are on private networks, clients are on the internet |
-//! | `SingleHeader(header)` | a CDN sets one header, such as `CF-Connecting-IP` |
-//! | `ConnectInfo` | there is no proxy |
-//! | `Chain(sources)` | try several sources in order |
-//!
-//! ```rust
-//! use axum_ipware::{header, ClientIpSource, IpFilter};
-//!
-//! # fn main() -> Result<(), axum_ipware::RuleError> {
-//! let filter = IpFilter::new()
-//!     .trust_private(true)
-//!     .source(ClientIpSource::RightmostTrustedRange(header::X_FORWARDED_FOR))
-//!     .max_forwarded_hops(10);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! Rightmost sources read `X-Forwarded-For` lists and RFC 7239 `Forwarded`
-//! headers, and stop at the first entry they cannot parse.
+//! [`ClientIpStrategy`](ipware::ClientIpStrategy) also covers a fixed proxy count,
+//! the rightmost public address, single-IP CDN headers such as `CF-Connecting-IP`,
+//! RFC 7239 `Forwarded`, ipware's own header lookup, and chains of these. Without a
+//! resolver, the filter uses the peer address.
 //!
 //! ## 🛑 Custom rejections
 //!
@@ -107,7 +84,7 @@
 //! use axum::response::IntoResponse;
 //! use axum_ipware::IpFilter;
 //!
-//! # fn main() -> Result<(), axum_ipware::RuleError> {
+//! # fn main() -> Result<(), axum_ipware::ipware::IpRangeError> {
 //! let filter = IpFilter::new()
 //!     .block(["203.0.113.0/24"])?
 //!     .on_block(|rejection| {
@@ -122,12 +99,8 @@
 
 mod client_ip;
 mod filter;
-pub mod header;
-mod rules;
-mod source;
 
-pub use client_ip::{ClientIp, IpSource, MissingClientIp};
+pub use client_ip::{ClientIp, MissingClientIp};
 pub use filter::{IpFilter, IpFilterService, RejectReason, Rejection};
 pub use ipware;
-pub use rules::RuleError;
-pub use source::ClientIpSource;
+pub use ipware::IpSource;

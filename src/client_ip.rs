@@ -6,6 +6,7 @@ use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use ipware::{IpSource, ResolvedIp};
 
 /// The client IP address resolved by [`IpFilter`](crate::IpFilter).
 ///
@@ -26,16 +27,10 @@ pub struct ClientIp {
     pub source: IpSource,
 }
 
-/// Where a [`ClientIp`] was read from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IpSource {
-    /// A proxy header such as `X-Forwarded-For`, resolved by ipware.
-    Header {
-        /// `true` when the header matched the configured trusted proxies or proxy count.
-        trusted_route: bool,
-    },
-    /// The TCP peer address from [`ConnectInfo`](axum::extract::ConnectInfo).
-    Peer,
+impl From<ResolvedIp> for ClientIp {
+    fn from(resolved: ResolvedIp) -> Self {
+        ClientIp { ip: resolved.ip, source: resolved.source }
+    }
 }
 
 impl fmt::Display for ClientIp {

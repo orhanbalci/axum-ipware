@@ -5,16 +5,14 @@ use std::task::{Context, Poll};
 
 use axum::extract::connect_info::MockConnectInfo;
 use axum::extract::ConnectInfo;
-use axum::http::{HeaderMap, Request, StatusCode, Uri};
+use axum::http::{Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::{self, Either, Ready};
-use ipware::IpWare;
+use ipware::{ClientIpResolver, IpRangeError, IpRanges};
 use tower_layer::Layer;
 use tower_service::Service;
 
-use crate::client_ip::{ClientIp, IpSource};
-use crate::rules::{IpRules, RuleError};
-use crate::source::{self, ClientIpSource};
+use crate::client_ip::ClientIp;
 
 type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 
@@ -26,16 +24,12 @@ type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 ///
 /// # Resolving the client IP
 ///
-/// The client IP is the TCP peer address from [`ConnectInfo`] (or [`MockConnectInfo`]
-/// in tests), so serve the app with
+/// The client IP is resolved by a [`ClientIpResolver`] from the request headers
+/// and the TCP peer address from [`ConnectInfo`] (or [`MockConnectInfo`] in
+/// tests), so serve the app with
 /// [`into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info).
-///
-/// Proxy headers are read only when the peer is one of the
-/// [`trusted_proxies`](Self::trusted_proxies), using the configured
-/// [`source`](Self::source). The default source is [`IpWare`], whose header address
-/// is used only when ipware also reports a trusted route, which requires a proxy
-/// count or a trusted proxy list in its [`IpWareProxy`](ipware::IpWareProxy) config.
-/// [`allow_untrusted`](Self::allow_untrusted) skips both checks.
+/// The default resolver uses the peer address only; configure one with
+/// [`resolver`](Self::resolver) to read proxy headers from trusted proxies.
 ///
 /// # Rules
 ///
@@ -49,17 +43,9 @@ pub struct IpFilter {
 
 #[derive(Clone)]
 struct Config {
-    source: ClientIpSource,
-    ipware: IpWare,
-    strict: bool,
-    allow_untrusted: bool,
-    trusted_proxies: IpRules,
-    trust_loopback: bool,
-    trust_private: bool,
-    trust_link_local: bool,
-    max_forwarded_hops: Option<usize>,
-    allow: IpRules,
-    block: IpRules,
+    resolver: ClientIpResolver,
+    allow: IpRanges,
+    block: IpRanges,
     on_block: Option<BlockHandler>,
 }
 
@@ -70,21 +56,13 @@ impl Default for IpFilter {
 }
 
 impl IpFilter {
-    /// Creates a filter with no rules that uses ipware's default header lookup.
+    /// Creates a filter with no rules that uses the peer address as the client IP.
     pub fn new() -> Self {
         IpFilter {
             inner: Arc::new(Config {
-                source: ClientIpSource::Ipware,
-                ipware: IpWare::default(),
-                strict: false,
-                allow_untrusted: false,
-                trusted_proxies: IpRules::default(),
-                trust_loopback: false,
-                trust_private: false,
-                trust_link_local: false,
-                max_forwarded_hops: None,
-                allow: IpRules::default(),
-                block: IpRules::default(),
+                resolver: ClientIpResolver::default(),
+                allow: IpRanges::new(),
+                block: IpRanges::new(),
                 on_block: None,
             }),
         }
@@ -94,118 +72,51 @@ impl IpFilter {
         Arc::make_mut(&mut self.inner)
     }
 
-    /// Sets where the client IP is read from. Defaults to [`ClientIpSource::Ipware`].
+    /// Sets how the client IP is resolved.
     ///
     /// ```rust
-    /// use axum_ipware::{header, ClientIpSource, IpFilter};
+    /// use axum_ipware::ipware::{header, ClientIpResolver, ClientIpStrategy, IpRanges};
+    /// use axum_ipware::IpFilter;
     ///
-    /// # fn main() -> Result<(), axum_ipware::RuleError> {
-    /// let filter = IpFilter::new().trusted_proxies(["10.0.0.0/8"])?.source(
-    ///     ClientIpSource::RightmostTrustedRange(header::X_FORWARDED_FOR),
+    /// # fn main() -> Result<(), axum_ipware::ipware::IpRangeError> {
+    /// let filter = IpFilter::new().resolver(
+    ///     ClientIpResolver::new(ClientIpStrategy::rightmost_trusted_range(
+    ///         header::X_FORWARDED_FOR,
+    ///     ))
+    ///     .trusted_proxies(IpRanges::parse(["10.0.0.0/8"])?),
     /// );
     /// # Ok(())
     /// # }
     /// ```
-    pub fn source(mut self, source: ClientIpSource) -> Self {
-        self.config().source = source;
-        self
-    }
-
-    /// Sets the ipware instance used by [`ClientIpSource::Ipware`].
-    pub fn ipware(mut self, ipware: IpWare) -> Self {
-        self.config().ipware = ipware;
-        self
-    }
-
-    /// Passes `strict` to [`IpWare::get_client_ip`]. Defaults to `false`.
-    pub fn strict(mut self, strict: bool) -> Self {
-        self.config().strict = strict;
-        self
-    }
-
-    /// Uses header addresses even when the peer is not a trusted proxy or ipware
-    /// cannot verify the proxy route.
-    ///
-    /// Clients can set these headers themselves, so only enable this when every
-    /// request reaches the app through a proxy that overwrites them. Defaults to `false`.
-    pub fn allow_untrusted(mut self, allow_untrusted: bool) -> Self {
-        self.config().allow_untrusted = allow_untrusted;
-        self
-    }
-
-    /// Adds IP addresses or CIDR ranges of the proxies in front of the app.
-    ///
-    /// Proxy headers are only read for requests whose TCP peer is in these ranges.
-    /// Requests from other peers use the peer address, so clients that reach the
-    /// app directly cannot spoof their IP with headers.
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), axum_ipware::RuleError> {
-    /// let filter = axum_ipware::IpFilter::new().trusted_proxies(["10.0.0.0/8"])?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn trusted_proxies<I, R>(mut self, rules: I) -> Result<Self, RuleError>
-    where
-        I: IntoIterator<Item = R>,
-        R: AsRef<str>,
-    {
-        self.config().trusted_proxies.extend(rules)?;
-        Ok(self)
-    }
-
-    /// Treats loopback addresses (`127.0.0.0/8`, `::1`) as trusted proxies.
-    pub fn trust_loopback(mut self, trust: bool) -> Self {
-        self.config().trust_loopback = trust;
-        self
-    }
-
-    /// Treats private addresses (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
-    /// `100.64.0.0/10`, `fc00::/7`) as trusted proxies.
-    pub fn trust_private(mut self, trust: bool) -> Self {
-        self.config().trust_private = trust;
-        self
-    }
-
-    /// Treats link-local addresses (`169.254.0.0/16`, `fe80::/10`) as trusted proxies.
-    pub fn trust_link_local(mut self, trust: bool) -> Self {
-        self.config().trust_link_local = trust;
-        self
-    }
-
-    /// Reads at most `hops` entries from the right of forwarding headers.
-    ///
-    /// Applies to the rightmost sources; addresses further left are never used.
-    /// Unlimited by default.
-    pub fn max_forwarded_hops(mut self, hops: usize) -> Self {
-        self.config().max_forwarded_hops = Some(hops);
+    pub fn resolver(mut self, resolver: ClientIpResolver) -> Self {
+        self.config().resolver = resolver;
         self
     }
 
     /// Adds IP addresses or CIDR ranges to the allow list.
     ///
     /// ```rust
-    /// # fn main() -> Result<(), axum_ipware::RuleError> {
+    /// # fn main() -> Result<(), axum_ipware::ipware::IpRangeError> {
     /// let filter = axum_ipware::IpFilter::new().allow(["10.0.0.0/8", "2001:db8::1"])?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn allow<I, R>(mut self, rules: I) -> Result<Self, RuleError>
+    pub fn allow<I, R>(mut self, ranges: I) -> Result<Self, IpRangeError>
     where
         I: IntoIterator<Item = R>,
         R: AsRef<str>,
     {
-        self.config().allow.extend(rules)?;
+        self.config().allow.extend(ranges)?;
         Ok(self)
     }
 
     /// Adds IP addresses or CIDR ranges to the block list.
-    pub fn block<I, R>(mut self, rules: I) -> Result<Self, RuleError>
+    pub fn block<I, R>(mut self, ranges: I) -> Result<Self, IpRangeError>
     where
         I: IntoIterator<Item = R>,
         R: AsRef<str>,
     {
-        self.config().block.extend(rules)?;
+        self.config().block.extend(ranges)?;
         Ok(self)
     }
 
@@ -219,28 +130,10 @@ impl IpFilter {
     }
 
     fn resolve<B>(&self, req: &Request<B>) -> Option<ClientIp> {
-        let config = &self.inner;
-        let peer_ip = peer_ip(req);
-        let trusted_peer = peer_ip.is_some_and(|ip| self.is_trusted_proxy(ip));
-        let peer = peer_ip.map(|ip| ClientIp { ip, source: IpSource::Peer });
-        if !(trusted_peer || config.allow_untrusted) {
-            return peer;
-        }
-        let lookup = Lookup {
-            filter: self,
-            headers: req.headers(),
-            peer,
-            trusted_peer,
-        };
-        lookup.from(&config.source).or(peer)
-    }
-
-    fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
-        let config = &self.inner;
-        config.trusted_proxies.contains(ip)
-            || (config.trust_loopback && source::is_loopback(ip))
-            || (config.trust_private && source::is_private(ip))
-            || (config.trust_link_local && source::is_link_local(ip))
+        self.inner
+            .resolver
+            .resolve(req.headers(), peer_ip(req))
+            .map(ClientIp::from)
     }
 
     fn check(&self, ip: Option<IpAddr>) -> Result<(), RejectReason> {
@@ -274,79 +167,6 @@ impl IpFilter {
     }
 }
 
-/// Reads the client IP from one request with a [`ClientIpSource`].
-struct Lookup<'a> {
-    filter: &'a IpFilter,
-    headers: &'a HeaderMap,
-    peer: Option<ClientIp>,
-    trusted_peer: bool,
-}
-
-impl Lookup<'_> {
-    fn from(&self, client_ip_source: &ClientIpSource) -> Option<ClientIp> {
-        let config = &self.filter.inner;
-        let ip = match client_ip_source {
-            ClientIpSource::ConnectInfo => return self.peer,
-            ClientIpSource::Ipware => {
-                let (ip, trusted_route) = config.ipware.get_client_ip(self.headers, config.strict);
-                let ip = ip.filter(|_| trusted_route || config.allow_untrusted)?;
-                return Some(ClientIp {
-                    ip: ip.to_canonical(),
-                    source: IpSource::Header { trusted_route },
-                });
-            }
-            ClientIpSource::Chain(sources) => {
-                return sources
-                    .iter()
-                    .find_map(|client_ip_source| self.from(client_ip_source));
-            }
-            ClientIpSource::SingleHeader(name) => source::single_ip(self.headers, name),
-            ClientIpSource::RightmostNonPrivate(name) => {
-                self.rightmost(name, |ip| !source::is_non_public(ip))
-            }
-            ClientIpSource::RightmostTrustedRange(name) => {
-                self.rightmost(name, |ip| !self.filter.is_trusted_proxy(ip))
-            }
-            ClientIpSource::RightmostTrustedCount(name, count) => {
-                let ips = self.hops(name);
-                count
-                    .checked_sub(1)
-                    .and_then(|index| ips.get(index).copied().flatten())
-            }
-        }?;
-        Some(ClientIp {
-            ip,
-            source: IpSource::Header { trusted_route: self.trusted_peer },
-        })
-    }
-
-    /// Forwarding header entries from the right, limited to `max_forwarded_hops`.
-    fn hops(&self, name: &axum::http::HeaderName) -> Vec<Option<IpAddr>> {
-        let limit = self.filter.inner.max_forwarded_hops.unwrap_or(usize::MAX);
-        source::forwarded_ips(self.headers, name)
-            .into_iter()
-            .rev()
-            .take(limit)
-            .collect()
-    }
-
-    /// The first entry from the right accepted by `is_client`. Stops at an
-    /// unparseable entry, since anything left of it cannot be trusted.
-    fn rightmost(
-        &self,
-        name: &axum::http::HeaderName,
-        is_client: impl Fn(IpAddr) -> bool,
-    ) -> Option<IpAddr> {
-        for ip in self.hops(name) {
-            let ip = ip?;
-            if is_client(ip) {
-                return Some(ip);
-            }
-        }
-        None
-    }
-}
-
 /// The TCP peer address, from [`ConnectInfo`] or [`MockConnectInfo`].
 fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
     let extensions = req.extensions();
@@ -358,22 +178,14 @@ fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
                 .get::<MockConnectInfo<SocketAddr>>()
                 .map(|MockConnectInfo(addr)| addr)
         })
-        .map(|addr| addr.ip().to_canonical())
+        .map(|addr| addr.ip())
 }
 
 impl fmt::Debug for IpFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let config = &self.inner;
         f.debug_struct("IpFilter")
-            .field("source", &config.source)
-            .field("ipware", &config.ipware)
-            .field("strict", &config.strict)
-            .field("allow_untrusted", &config.allow_untrusted)
-            .field("trusted_proxies", &config.trusted_proxies)
-            .field("trust_loopback", &config.trust_loopback)
-            .field("trust_private", &config.trust_private)
-            .field("trust_link_local", &config.trust_link_local)
-            .field("max_forwarded_hops", &config.max_forwarded_hops)
+            .field("resolver", &config.resolver)
             .field("allow", &config.allow)
             .field("block", &config.block)
             .field("on_block", &config.on_block.is_some())

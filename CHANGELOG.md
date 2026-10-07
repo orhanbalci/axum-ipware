@@ -9,25 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `ClientIpSource` to choose how the client IP is read: `ConnectInfo`, `Ipware`
-  (default), `SingleHeader`, `RightmostNonPrivate`, `RightmostTrustedCount`,
-  `RightmostTrustedRange`, and `Chain`.
-- RFC 7239 `Forwarded` header parsing; `X-Forwarded-For` entries with ports,
-  brackets, quotes and IPv6 zones; multiple header lines are combined.
-- `trust_loopback`, `trust_private`, and `trust_link_local` switches for trusted proxies.
-- `max_forwarded_hops` to limit how far the rightmost sources walk.
-- `header` module with common client IP header names.
-
-- `IpFilter` tower layer: resolves the client IP with ipware, falls back to the
-  `ConnectInfo` peer address, and applies allow/block rules.
+- `IpFilter` tower layer: resolves the client IP, applies allow/block rules, and
+  stores the address as a `ClientIp` request extension.
+- Client IP resolution through ipware's `ClientIpResolver`, set with
+  `IpFilter::resolver`. Proxy headers are only read when the TCP peer is a
+  trusted proxy; otherwise, and by default, the peer address from `ConnectInfo`
+  (or `MockConnectInfo` in tests) is used.
+- All ipware `ClientIpStrategy` options: rightmost trusted range, rightmost
+  trusted count, rightmost non-private, single header, ipware lookup, and chains;
+  `X-Forwarded-For` and RFC 7239 `Forwarded` headers.
 - IP address and CIDR rules for IPv4 and IPv6; block rules win over allow rules.
-- `trusted_proxies`: proxy headers are only read when the TCP peer is in these
-  ranges and ipware verifies the route; other requests use the peer address.
-  `allow_untrusted` skips both checks.
-- Private and loopback client IPs (e.g. `10.1.2.3`) behind a trusted proxy are
-  resolved from the header instead of falling back to the proxy address, so
-  intranet allow lists match the real client. Requires the ipware fix, used from
-  git until ipware 0.4.1 is released.
+  Requests are rejected when rules exist and no IP can be resolved.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.
+
+ipware is used from git until the release that includes `ClientIpResolver`.

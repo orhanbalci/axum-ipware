@@ -6,7 +6,15 @@ use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use axum_ipware::ipware::{IpWare, IpWareConfig, IpWareProxy};
+use axum_ipware::ipware::{
+    header,
+    ClientIpResolver,
+    ClientIpStrategy,
+    IpRanges,
+    IpWare,
+    IpWareConfig,
+    IpWareProxy,
+};
 use axum_ipware::{ClientIp, IpFilter, IpSource, RejectReason};
 use tower::ServiceExt;
 
@@ -31,11 +39,12 @@ fn app(filter: IpFilter, peer: Option<&str>) -> Router {
     }
 }
 
-fn proxied(count: u16) -> IpWare {
-    IpWare::new(
-        IpWareConfig::new(["x-forwarded-for"], true),
-        IpWareProxy::new(count, vec![]),
-    )
+/// Load balancers in 10.0.0.0/8 appending to X-Forwarded-For.
+fn behind_proxy() -> ClientIpResolver {
+    ClientIpResolver::new(ClientIpStrategy::rightmost_trusted_range(
+        header::X_FORWARDED_FOR,
+    ))
+    .trusted_proxies(IpRanges::parse(["10.0.0.0/8"]).unwrap())
 }
 
 async fn send(app: Router, xff: Option<&str>) -> (StatusCode, String) {
@@ -95,21 +104,18 @@ async fn rejects_unresolved_ip_when_rules_exist() {
 }
 
 #[tokio::test]
-async fn ignores_untrusted_headers() {
+async fn default_resolver_ignores_headers() {
     let filter = IpFilter::new().allow(["10.0.0.0/8"]).unwrap();
     let (status, _) = send(app(filter, Some("198.51.100.1")), Some("10.0.0.1")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn uses_header_on_trusted_route() {
-    let filter = IpFilter::new()
-        .ipware(proxied(1))
-        .trusted_proxies(["10.0.0.0/8"])
-        .unwrap();
+async fn uses_header_from_trusted_proxy() {
+    let filter = IpFilter::new().resolver(behind_proxy());
     let (status, body) = send(
         app(filter, Some("10.0.0.2")),
-        Some("6.6.6.6, 93.184.216.34, 10.0.0.2"),
+        Some("6.6.6.6, 93.184.216.34, 10.0.0.5"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -117,94 +123,64 @@ async fn uses_header_on_trusted_route() {
 }
 
 #[tokio::test]
-async fn ignores_headers_without_trusted_proxies() {
-    let filter = IpFilter::new().ipware(proxied(1));
-    let (_, body) = send(
-        app(filter, Some("10.0.0.2")),
-        Some("93.184.216.34, 10.0.0.2"),
-    )
-    .await;
-    assert_eq!(body, "peer 10.0.0.2");
-}
-
-#[tokio::test]
 async fn ignores_spoofed_header_from_direct_client() {
     let filter = IpFilter::new()
-        .ipware(proxied(1))
-        .trusted_proxies(["10.0.0.0/8"])
-        .unwrap()
+        .resolver(behind_proxy())
         .allow(["93.184.216.0/24"])
         .unwrap();
-    // The client connects directly and forges a route that ipware would accept.
-    let (status, body) = send(
-        app(filter, Some("198.51.100.1")),
-        Some("93.184.216.34, 198.51.100.1"),
-    )
-    .await;
+    let (status, body) = send(app(filter, Some("198.51.100.1")), Some("93.184.216.34")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body, "Forbidden");
 }
 
 #[tokio::test]
-async fn trusted_proxy_without_verified_route_uses_peer() {
-    // Default ipware has no proxy count or list, so it cannot verify the route.
-    let filter = IpFilter::new().trusted_proxies(["10.0.0.0/8"]).unwrap();
-    let (_, body) = send(
-        app(filter, Some("10.0.0.2")),
-        Some("93.184.216.34, 10.0.0.2"),
-    )
-    .await;
-    assert_eq!(body, "peer 10.0.0.2");
-}
-
-#[tokio::test]
 async fn rules_apply_to_header_ip_from_trusted_proxy() {
     let filter = IpFilter::new()
-        .ipware(proxied(1))
-        .trusted_proxies(["10.0.0.0/8"])
-        .unwrap()
+        .resolver(behind_proxy())
         .block(["93.184.216.34"])
         .unwrap();
-    let (status, _) = send(
-        app(filter, Some("10.0.0.2")),
-        Some("93.184.216.34, 10.0.0.2"),
-    )
-    .await;
+    let (status, _) = send(app(filter, Some("10.0.0.2")), Some("93.184.216.34")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
 async fn private_client_behind_trusted_proxy() {
     let filter = IpFilter::new()
-        .ipware(proxied(1))
-        .trusted_proxies(["10.0.0.2"])
-        .unwrap()
+        .resolver(
+            ClientIpResolver::new(ClientIpStrategy::rightmost_trusted_range(
+                header::X_FORWARDED_FOR,
+            ))
+            .trusted_proxies(IpRanges::parse(["10.0.0.0/24"]).unwrap()),
+        )
         .allow(["10.1.0.0/16"])
         .unwrap();
-    let (status, body) = send(app(filter, Some("10.0.0.2")), Some("10.1.2.3, 10.0.0.2")).await;
+    let (status, body) = send(app(filter, Some("10.0.0.2")), Some("10.1.2.3")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "header 10.1.2.3 true");
 }
 
 #[tokio::test]
-async fn ipv4_mapped_peer_matches_trusted_proxies() {
-    let filter = IpFilter::new()
-        .ipware(proxied(1))
-        .trusted_proxies(["10.0.0.0/8"])
-        .unwrap();
+async fn ipware_strategy_behind_trusted_proxy() {
+    let ipware = IpWare::new(
+        IpWareConfig::new(["x-forwarded-for"], true),
+        IpWareProxy::new(1, vec![]),
+    );
+    let filter = IpFilter::new().resolver(
+        ClientIpResolver::new(ClientIpStrategy::ipware(ipware, false))
+            .trusted_proxies(IpRanges::parse(["10.0.0.0/8"]).unwrap()),
+    );
     let (_, body) = send(
-        app(filter, Some("::ffff:10.0.0.2")),
+        app(filter.clone(), Some("10.0.0.2")),
         Some("93.184.216.34, 10.0.0.2"),
     )
     .await;
     assert_eq!(body, "header 93.184.216.34 true");
-}
-
-#[tokio::test]
-async fn allow_untrusted_uses_header() {
-    let filter = IpFilter::new().allow_untrusted(true);
-    let (_, body) = send(app(filter, Some("10.0.0.2")), Some("203.0.113.7")).await;
-    assert_eq!(body, "header 203.0.113.7 false");
+    let (_, body) = send(
+        app(filter, Some("198.51.100.1")),
+        Some("93.184.216.34, 10.0.0.2"),
+    )
+    .await;
+    assert_eq!(body, "peer 198.51.100.1");
 }
 
 #[tokio::test]
@@ -237,178 +213,4 @@ async fn extractor_without_layer_is_internal_error() {
     let app = Router::new().route("/", get(handler));
     let (status, _) = send(app, None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-mod sources {
-    use axum_ipware::{header, ClientIpSource};
-
-    use super::*;
-
-    async fn resolve(filter: IpFilter, peer: &str, xff: &str) -> String {
-        send(app(filter, Some(peer)), Some(xff)).await.1
-    }
-
-    fn behind_proxy(source: ClientIpSource) -> IpFilter {
-        IpFilter::new()
-            .trusted_proxies(["10.0.0.0/8"])
-            .unwrap()
-            .source(source)
-    }
-
-    #[tokio::test]
-    async fn connect_info_ignores_headers() {
-        let filter = behind_proxy(ClientIpSource::ConnectInfo);
-        assert_eq!(
-            resolve(filter, "10.0.0.2", "93.184.216.34").await,
-            "peer 10.0.0.2"
-        );
-    }
-
-    #[tokio::test]
-    async fn rightmost_trusted_range_skips_proxies() {
-        let filter = behind_proxy(ClientIpSource::RightmostTrustedRange(
-            header::X_FORWARDED_FOR,
-        ));
-        let body = resolve(
-            filter,
-            "10.0.0.2",
-            "6.6.6.6, 93.184.216.34, 10.0.0.9, 10.0.0.5",
-        )
-        .await;
-        assert_eq!(body, "header 93.184.216.34 true");
-    }
-
-    #[tokio::test]
-    async fn rightmost_trusted_range_keeps_private_clients() {
-        let filter = IpFilter::new()
-            .trusted_proxies(["10.0.0.0/24"])
-            .unwrap()
-            .source(ClientIpSource::RightmostTrustedRange(
-                header::X_FORWARDED_FOR,
-            ));
-        let body = resolve(filter, "10.0.0.2", "10.1.2.3, 10.0.0.5").await;
-        assert_eq!(body, "header 10.1.2.3 true");
-    }
-
-    #[tokio::test]
-    async fn rightmost_stops_at_invalid_entry() {
-        let filter = behind_proxy(ClientIpSource::RightmostTrustedRange(
-            header::X_FORWARDED_FOR,
-        ));
-        let body = resolve(filter, "10.0.0.2", "93.184.216.34, garbage, 10.0.0.5").await;
-        assert_eq!(body, "peer 10.0.0.2");
-    }
-
-    #[tokio::test]
-    async fn rightmost_non_private() {
-        let filter = behind_proxy(ClientIpSource::RightmostNonPrivate(header::X_FORWARDED_FOR));
-        let body = resolve(filter, "10.0.0.2", "6.6.6.6, 93.184.216.34, 192.168.1.1").await;
-        assert_eq!(body, "header 93.184.216.34 true");
-    }
-
-    #[tokio::test]
-    async fn rightmost_trusted_count() {
-        let source = ClientIpSource::RightmostTrustedCount(header::X_FORWARDED_FOR, 2);
-        let body = resolve(
-            behind_proxy(source.clone()),
-            "10.0.0.2",
-            "6.6.6.6, 93.184.216.34, 10.0.0.9",
-        )
-        .await;
-        assert_eq!(body, "header 93.184.216.34 true");
-        // Fewer entries than proxies: fall back to the peer.
-        let body = resolve(behind_proxy(source), "10.0.0.2", "93.184.216.34").await;
-        assert_eq!(body, "peer 10.0.0.2");
-    }
-
-    #[tokio::test]
-    async fn single_header() {
-        let filter = behind_proxy(ClientIpSource::SingleHeader(header::X_REAL_IP));
-        let req = Request::builder()
-            .uri("/")
-            .header("x-real-ip", "93.184.216.34")
-            .body(Body::empty())
-            .unwrap();
-        let res = app(filter, Some("10.0.0.2")).oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body, "header 93.184.216.34 true");
-    }
-
-    #[tokio::test]
-    async fn forwarded_header() {
-        let filter = behind_proxy(ClientIpSource::RightmostTrustedRange(header::FORWARDED));
-        let req = Request::builder()
-            .uri("/")
-            .header(
-                "forwarded",
-                "for=6.6.6.6, for=\"[2606:4700::1111]:443\";proto=https, for=10.0.0.5",
-            )
-            .body(Body::empty())
-            .unwrap();
-        let res = app(filter, Some("10.0.0.2")).oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body, "header 2606:4700::1111 true");
-    }
-
-    #[tokio::test]
-    async fn chain_falls_through() {
-        let filter = behind_proxy(ClientIpSource::Chain(vec![
-            ClientIpSource::SingleHeader(header::CF_CONNECTING_IP),
-            ClientIpSource::RightmostTrustedRange(header::X_FORWARDED_FOR),
-        ]));
-        let body = resolve(filter, "10.0.0.2", "93.184.216.34, 10.0.0.5").await;
-        assert_eq!(body, "header 93.184.216.34 true");
-    }
-
-    #[tokio::test]
-    async fn sources_need_a_trusted_peer() {
-        let filter = behind_proxy(ClientIpSource::RightmostNonPrivate(header::X_FORWARDED_FOR));
-        assert_eq!(
-            resolve(filter, "198.51.100.1", "93.184.216.34").await,
-            "peer 198.51.100.1"
-        );
-    }
-
-    #[tokio::test]
-    async fn trust_private_switch() {
-        let filter =
-            IpFilter::new()
-                .trust_private(true)
-                .source(ClientIpSource::RightmostTrustedRange(
-                    header::X_FORWARDED_FOR,
-                ));
-        let body = resolve(filter, "192.168.0.2", "93.184.216.34, 172.16.0.9").await;
-        assert_eq!(body, "header 93.184.216.34 true");
-    }
-
-    #[tokio::test]
-    async fn trust_loopback_switch() {
-        let filter =
-            IpFilter::new()
-                .trust_loopback(true)
-                .source(ClientIpSource::RightmostTrustedRange(
-                    header::X_FORWARDED_FOR,
-                ));
-        let body = resolve(filter, "127.0.0.1", "93.184.216.34").await;
-        assert_eq!(body, "header 93.184.216.34 true");
-    }
-
-    #[tokio::test]
-    async fn max_forwarded_hops_limits_walk() {
-        let filter = behind_proxy(ClientIpSource::RightmostTrustedRange(
-            header::X_FORWARDED_FOR,
-        ))
-        .max_forwarded_hops(2);
-        let body = resolve(
-            filter,
-            "10.0.0.2",
-            "93.184.216.34, 10.0.0.7, 10.0.0.6, 10.0.0.5",
-        )
-        .await;
-        assert_eq!(body, "peer 10.0.0.2");
-    }
 }
