@@ -462,8 +462,17 @@ impl fmt::Debug for IpFilterHandle {
     }
 }
 
+/// Keeps the first `prefix` bits of an IPv6 address, e.g. its `/64` network.
+#[cfg(any(feature = "governor", feature = "autoban"))]
+pub(crate) fn mask_v6(ip: std::net::Ipv6Addr, prefix: u8) -> std::net::Ipv6Addr {
+    let mask = u128::MAX
+        .checked_shl(128 - u32::from(prefix.min(128)))
+        .unwrap_or(0);
+    std::net::Ipv6Addr::from(u128::from(ip) & mask)
+}
+
 /// The TCP peer address, from [`ConnectInfo`] or [`MockConnectInfo`].
-fn peer_ip(extensions: &Extensions) -> Option<IpAddr> {
+pub(crate) fn peer_ip(extensions: &Extensions) -> Option<IpAddr> {
     extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr)

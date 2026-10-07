@@ -25,6 +25,8 @@
 //! | --- | --- |
 //! | `providers` | platform presets and provider IP ranges from ipware |
 //! | `glob` | glob patterns such as `192.168.1.*` in lists and rules |
+//! | `governor` | a spoof-resistant client IP key for tower_governor rate limiting |
+//! | `autoban` | temporary bans after too many error responses, like fail2ban |
 //! | `refresh` | lists kept up to date from files or custom loaders |
 //! | `fetch` | an HTTPS source for `refresh`, built on reqwest with rustls |
 //!
@@ -161,6 +163,48 @@
 //! });
 //! let stats = filter.stats();
 //! println!("{} allowed, {} blocked", stats.allowed, stats.blocked);
+//! ```
+//!
+//! ## 🛡️ Rate limiting and automatic bans
+//!
+//! With the `governor` feature, `governor::ClientIpKeyExtractor` rate limits
+//! [tower_governor](https://docs.rs/tower_governor) by the resolved client IP.
+//! tower_governor's own IP extractors trust `X-Forwarded-For` from any client, so
+//! a client can dodge limits by sending a new address with every request.
+//!
+//! With the `autoban` feature, `autoban::AutoBan` bans clients for a while after
+//! too many error responses (401, 403, 404 and 429 by default), with an exempt
+//! list, a cap on tracked clients, and IPv6 clients grouped by `/64`.
+//!
+//! ```rust
+//! # #[cfg(all(feature = "governor", feature = "autoban"))] {
+//! use std::time::Duration;
+//!
+//! use axum::routing::get;
+//! use axum::Router;
+//! use axum_ipware::autoban::AutoBan;
+//! use axum_ipware::governor::ClientIpKeyExtractor;
+//! use axum_ipware::IpFilter;
+//! use tower_governor::governor::GovernorConfigBuilder;
+//! use tower_governor::GovernorLayer;
+//!
+//! let limits = GovernorConfigBuilder::default()
+//!     .per_second(1)
+//!     .burst_size(10)
+//!     .key_extractor(ClientIpKeyExtractor::new().ipv6_prefix(64))
+//!     .finish()
+//!     .unwrap();
+//! let autoban = AutoBan::new()
+//!     .max_strikes(20)
+//!     .ban_for(Duration::from_secs(15 * 60));
+//!
+//! // Layers added last run first: IpFilter resolves the client IP for the others.
+//! let app: Router = Router::new()
+//!     .route("/", get(|| async { "hello" }))
+//!     .layer(GovernorLayer::new(limits))
+//!     .layer(autoban.clone())
+//!     .layer(IpFilter::new());
+//! # }
 //! ```
 //!
 //! ## 🔄 Live updates
@@ -303,8 +347,12 @@
 //! [`IpFilterHandle`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilterHandle.html
 //! [`refresh::Refresh`]: https://docs.rs/axum-ipware/latest/axum_ipware/refresh/struct.Refresh.html
 
+#[cfg(feature = "autoban")]
+pub mod autoban;
 mod client_ip;
 mod filter;
+#[cfg(feature = "governor")]
+pub mod governor;
 #[cfg(feature = "refresh")]
 pub mod refresh;
 mod rules;

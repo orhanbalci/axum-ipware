@@ -17,6 +17,10 @@ exclude = [".github", "rustfmt.toml"]
 providers = ["ipware/providers"]
 # Glob patterns such as `192.168.1.*` for allow/block lists and rules
 glob = []
+# Temporary bans after too many error responses, like fail2ban
+autoban = ["dep:pin-project-lite"]
+# Rate limit key for tower_governor based on the resolved client IP
+governor = ["dep:tower_governor"]
 # Keep lists up to date from files or custom loaders
 refresh = ["dep:tokio"]
 # HTTPS source for `refresh`, built on reqwest with rustls
@@ -27,8 +31,10 @@ arc-swap = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
 ipware = { version = "0.5", git = "https://github.com/orhanbalci/ipware.git", rev = "cfc6a6685b944b0463927f18755914d94ad22939" }
+pin-project-lite = { version = "0.2", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 tokio = { version = "1", features = ["fs", "rt", "time"], optional = true }
+tower_governor = { version = "0.8", default-features = false, features = ["axum", "tracing"], optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"

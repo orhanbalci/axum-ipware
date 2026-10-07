@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Rejection`.
 - `glob` feature: glob patterns such as `192.168.1.*` in allow and block lists
   and rules.
+- `governor` feature: `governor::ClientIpKeyExtractor`, a tower_governor key that
+  rate limits by the resolved client IP instead of client-supplied headers, with
+  optional IPv6 prefix grouping.
+- `autoban` feature: `autoban::AutoBan`, a layer that temporarily bans clients
+  after too many matching responses, with an exempt list, a cap on tracked
+  clients, IPv6 prefix grouping, and manual `ban` / `unban`.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.

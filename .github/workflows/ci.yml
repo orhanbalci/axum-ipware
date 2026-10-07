@@ -23,6 +23,12 @@ jobs:
             features: --features providers
           - name: refresh
             features: --features refresh
+          - name: glob
+            features: --features glob
+          - name: governor
+            features: --features governor
+          - name: autoban
+            features: --features autoban
           - name: all features
             features: --all-features
     steps:
