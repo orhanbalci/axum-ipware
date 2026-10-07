@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-07
+
 ### Added
 
 - `IpFilter` tower layer: resolves the client IP, applies allow/block rules, and
@@ -66,4 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Runnable examples: `basic`, `behind_proxy`, `live_updates`, `refresh`,
   `rate_limit`, `geo` and `crowdsec`.
 
-Requires ipware 0.5 with `IpRanges` address counts and `forwarded_origin` (from git until the next ipware release).
+Requires ipware 0.5.1.
+
+[Unreleased]: https://github.com/orhanbalci/axum-ipware/compare/v0.1.0...main
+[0.1.0]: https://github.com/orhanbalci/axum-ipware/releases/tag/v0.1.0
