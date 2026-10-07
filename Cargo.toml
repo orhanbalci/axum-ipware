@@ -1,0 +1,26 @@
+[package]
+name = "axum-ipware"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "Client IP extraction and IP allow/block filtering middleware for axum, powered by ipware"
+repository = "https://github.com/orhanbalci/axum-ipware"
+homepage = "https://github.com/orhanbalci"
+keywords = ["axum", "ip", "filter", "middleware", "proxy"]
+categories = ["web-programming::http-server", "network-programming"]
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false }
+ipnet = "2.9"
+ipware = "0.4"
+tower-layer = "0.3"
+tower-service = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower = { version = "0.5", features = ["util"] }
