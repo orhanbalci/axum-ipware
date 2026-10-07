@@ -17,6 +17,7 @@ exclude = [".github", "rustfmt.toml"]
 providers = ["ipware/providers"]
 
 [dependencies]
+arc-swap = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
 ipware = "0.5"

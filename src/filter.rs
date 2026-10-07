@@ -1,11 +1,14 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arc_swap::ArcSwap;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::extract::ConnectInfo;
-use axum::http::{Request, StatusCode, Uri};
+use axum::http::request::Parts;
+use axum::http::{Extensions, HeaderMap, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::{self, Either, Ready};
 use ipware::{ClientIpResolver, IpRangeError, IpRanges};
@@ -33,22 +36,83 @@ type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
 ///
 /// # Rules
 ///
-/// A request is rejected when its IP is in the block list, or when an allow list
-/// was set and does not contain the IP. The block list wins over the allow list.
-/// When rules are configured and no IP can be resolved, the request is rejected.
-/// Allowing an empty set of ranges rejects every request, so a provider list that
-/// unexpectedly comes back empty fails closed.
+/// A request is rejected when its IP is in a block list, or when it is in no
+/// allow list and either an allow list is set or [`default_deny`](Self::default_deny)
+/// is on. Block lists win over allow lists. When rules are configured and no IP
+/// can be resolved, the request is rejected. Allowing an empty set of ranges
+/// rejects every request, so a provider list that unexpectedly comes back empty
+/// fails closed.
+///
+/// # Live updates
+///
+/// Clones of an `IpFilter` share their rules, including the copies axum makes for
+/// each route. Use [`handle`](Self::handle) to change the rules while the server
+/// runs; every request sees either the old or the new rules, never a mix.
 #[derive(Clone)]
 pub struct IpFilter {
-    inner: Arc<Config>,
+    rules: Arc<ArcSwap<Rules>>,
 }
 
 #[derive(Clone)]
-struct Config {
+struct Rules {
     resolver: ClientIpResolver,
-    allow: Vec<IpRanges>,
-    block: Vec<IpRanges>,
+    allow: Vec<RuleList>,
+    block: Vec<RuleList>,
+    default_deny: bool,
     on_block: Option<BlockHandler>,
+}
+
+/// A set of ranges, optionally named so it can be replaced or removed later.
+#[derive(Clone, Debug)]
+struct RuleList {
+    name: Option<Cow<'static, str>>,
+    ranges: Arc<IpRanges>,
+}
+
+impl Rules {
+    fn has_rules(&self) -> bool {
+        self.default_deny || !self.allow.is_empty() || !self.block.is_empty()
+    }
+
+    fn check(&self, ip: Option<IpAddr>) -> Result<(), RejectReason> {
+        if !self.has_rules() {
+            return Ok(());
+        }
+        let Some(ip) = ip else {
+            return Err(RejectReason::Unresolved);
+        };
+        if self.block.iter().any(|list| list.ranges.contains(ip)) {
+            return Err(RejectReason::Blocked);
+        }
+        let allowed = self.allow.iter().any(|list| list.ranges.contains(ip));
+        if !allowed && (self.default_deny || !self.allow.is_empty()) {
+            return Err(RejectReason::NotAllowed);
+        }
+        Ok(())
+    }
+
+    fn resolve(&self, headers: &HeaderMap, extensions: &Extensions) -> Option<ClientIp> {
+        self.resolver
+            .resolve(headers, peer_ip(extensions))
+            .map(ClientIp::from)
+    }
+}
+
+/// Inserts `list` into `lists`, replacing a list with the same name.
+fn set_list(lists: &mut Vec<RuleList>, list: RuleList) {
+    match lists
+        .iter_mut()
+        .find(|existing| existing.name.is_some() && existing.name == list.name)
+    {
+        Some(existing) => *existing = list,
+        None => lists.push(list),
+    }
+}
+
+fn remove_list(lists: &mut Vec<RuleList>, name: &str) -> bool {
+    let before = lists.len();
+    lists.retain(|list| list.name.as_deref() != Some(name));
+    lists.len() != before
 }
 
 impl Default for IpFilter {
@@ -61,17 +125,19 @@ impl IpFilter {
     /// Creates a filter with no rules that uses the peer address as the client IP.
     pub fn new() -> Self {
         IpFilter {
-            inner: Arc::new(Config {
+            rules: Arc::new(ArcSwap::from_pointee(Rules {
                 resolver: ClientIpResolver::default(),
                 allow: Vec::new(),
                 block: Vec::new(),
+                default_deny: false,
                 on_block: None,
-            }),
+            })),
         }
     }
 
-    fn config(&mut self) -> &mut Config {
-        Arc::make_mut(&mut self.inner)
+    fn update(self, f: impl FnMut(&mut Rules)) -> Self {
+        update(&self.rules, f);
+        self
     }
 
     /// Sets how the client IP is resolved.
@@ -90,9 +156,8 @@ impl IpFilter {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn resolver(mut self, resolver: ClientIpResolver) -> Self {
-        self.config().resolver = resolver;
-        self
+    pub fn resolver(self, resolver: ClientIpResolver) -> Self {
+        self.update(|rules| rules.resolver = resolver.clone())
     }
 
     /// Adds IP addresses or CIDR ranges to the allow list.
@@ -123,8 +188,19 @@ impl IpFilter {
     /// let filter = IpFilter::new().allow_ranges(providers::github_hooks());
     /// # }
     /// ```
-    pub fn allow_ranges(mut self, ranges: IpRanges) -> Self {
-        self.config().allow.push(ranges);
+    pub fn allow_ranges(self, ranges: IpRanges) -> Self {
+        let ranges = Arc::new(ranges);
+        self.update(|rules| {
+            rules
+                .allow
+                .push(RuleList { name: None, ranges: ranges.clone() })
+        })
+    }
+
+    /// Adds a named set of ranges to the allow list, replacing a list with the
+    /// same name. Named lists can be replaced or removed with an [`IpFilterHandle`].
+    pub fn allow_list(self, name: impl Into<Cow<'static, str>>, ranges: IpRanges) -> Self {
+        self.handle().set_allow_list(name, ranges);
         self
     }
 
@@ -139,61 +215,160 @@ impl IpFilter {
 
     /// Adds a parsed set of ranges to the block list, such as a blocklist
     /// fetched at startup.
-    pub fn block_ranges(mut self, ranges: IpRanges) -> Self {
-        self.config().block.push(ranges);
+    pub fn block_ranges(self, ranges: IpRanges) -> Self {
+        let ranges = Arc::new(ranges);
+        self.update(|rules| {
+            rules
+                .block
+                .push(RuleList { name: None, ranges: ranges.clone() })
+        })
+    }
+
+    /// Adds a named set of ranges to the block list, replacing a list with the
+    /// same name. Named lists can be replaced or removed with an [`IpFilterHandle`].
+    pub fn block_list(self, name: impl Into<Cow<'static, str>>, ranges: IpRanges) -> Self {
+        self.handle().set_block_list(name, ranges);
         self
+    }
+
+    /// Rejects every IP that is not in an allow list, even when no allow list is
+    /// set. Defaults to `false`, where requests are allowed until an allow list
+    /// is added.
+    ///
+    /// Useful with allow lists loaded after startup: requests are rejected
+    /// until the first list arrives.
+    pub fn default_deny(self, deny: bool) -> Self {
+        self.update(|rules| rules.default_deny = deny)
     }
 
     /// Builds the response for rejected requests. Defaults to `403 Forbidden`.
-    pub fn on_block<F>(mut self, handler: F) -> Self
+    pub fn on_block<F>(self, handler: F) -> Self
     where
         F: Fn(&Rejection) -> Response + Send + Sync + 'static,
     {
-        self.config().on_block = Some(Arc::new(handler));
-        self
+        let handler: BlockHandler = Arc::new(handler);
+        self.update(|rules| rules.on_block = Some(handler.clone()))
     }
 
-    fn resolve<B>(&self, req: &Request<B>) -> Option<ClientIp> {
-        self.inner
-            .resolver
-            .resolve(req.headers(), peer_ip(req))
-            .map(ClientIp::from)
+    /// Returns a handle that changes this filter's rules while the server runs.
+    ///
+    /// ```rust
+    /// use axum_ipware::ipware::IpRanges;
+    /// use axum_ipware::IpFilter;
+    ///
+    /// let filter = IpFilter::new().default_deny(true);
+    /// let handle = filter.handle();
+    /// // ... add `filter` to the router and start the server ...
+    ///
+    /// // Later, e.g. from a background task:
+    /// handle.set_allow_list("office", IpRanges::parse(["192.0.2.0/24"]).unwrap());
+    /// ```
+    pub fn handle(&self) -> IpFilterHandle {
+        IpFilterHandle { rules: self.rules.clone() }
     }
 
-    fn check(&self, ip: Option<IpAddr>) -> Result<(), RejectReason> {
-        let config = &self.inner;
-        if config.allow.is_empty() && config.block.is_empty() {
-            return Ok(());
-        }
-        let Some(ip) = ip else {
-            return Err(RejectReason::Unresolved);
-        };
-        if config.block.iter().any(|ranges| ranges.contains(ip)) {
-            return Err(RejectReason::Blocked);
-        }
-        if !config.allow.is_empty() && !config.allow.iter().any(|ranges| ranges.contains(ip)) {
-            return Err(RejectReason::NotAllowed);
-        }
-        Ok(())
+    /// Resolves the client IP of a request, without applying the rules.
+    pub fn resolve<B>(&self, req: &Request<B>) -> Option<ClientIp> {
+        self.rules.load().resolve(req.headers(), req.extensions())
     }
 
-    fn reject(&self, rejection: Rejection) -> Response {
-        tracing::debug!(
-            ip = ?rejection.client_ip.map(|client_ip| client_ip.ip),
-            reason = %rejection.reason,
-            uri = %rejection.uri,
-            "request rejected by ip filter"
-        );
-        match &self.inner.on_block {
-            Some(handler) => handler(&rejection),
-            None => rejection.into_response(),
-        }
+    /// Resolves the client IP from request parts, without applying the rules.
+    pub fn resolve_parts(&self, parts: &Parts) -> Option<ClientIp> {
+        self.rules.load().resolve(&parts.headers, &parts.extensions)
+    }
+
+    /// Checks an IP against the current rules.
+    ///
+    /// ```rust
+    /// use axum_ipware::{IpFilter, RejectReason};
+    ///
+    /// # fn main() -> Result<(), axum_ipware::ipware::IpRangeError> {
+    /// let filter = IpFilter::new().block(["203.0.113.0/24"])?;
+    /// assert_eq!(
+    ///     filter.check("203.0.113.9".parse().unwrap()),
+    ///     Err(RejectReason::Blocked)
+    /// );
+    /// assert_eq!(filter.check("192.0.2.1".parse().unwrap()), Ok(()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn check(&self, ip: IpAddr) -> Result<(), RejectReason> {
+        self.rules.load().check(Some(ip.to_canonical()))
+    }
+}
+
+/// Applies `f` to a copy of the current rules and swaps it in.
+fn update(rules: &ArcSwap<Rules>, mut f: impl FnMut(&mut Rules)) {
+    rules.rcu(|current| {
+        let mut next = Rules::clone(current);
+        f(&mut next);
+        next
+    });
+}
+
+/// Changes the rules of an [`IpFilter`] while the server runs.
+///
+/// Created with [`IpFilter::handle`]. Cloning the handle is cheap, and every
+/// clone changes the same filter. Each change applies atomically to new requests.
+#[derive(Clone)]
+pub struct IpFilterHandle {
+    rules: Arc<ArcSwap<Rules>>,
+}
+
+impl IpFilterHandle {
+    /// Sets the allow list called `name`, replacing a list with the same name.
+    pub fn set_allow_list(&self, name: impl Into<Cow<'static, str>>, ranges: IpRanges) {
+        let list = RuleList { name: Some(name.into()), ranges: Arc::new(ranges) };
+        update(&self.rules, |rules| {
+            set_list(&mut rules.allow, list.clone())
+        });
+    }
+
+    /// Removes the allow list called `name`. Returns `false` when there was none.
+    pub fn remove_allow_list(&self, name: &str) -> bool {
+        let mut removed = false;
+        update(&self.rules, |rules| {
+            removed = remove_list(&mut rules.allow, name)
+        });
+        removed
+    }
+
+    /// Sets the block list called `name`, replacing a list with the same name.
+    pub fn set_block_list(&self, name: impl Into<Cow<'static, str>>, ranges: IpRanges) {
+        let list = RuleList { name: Some(name.into()), ranges: Arc::new(ranges) };
+        update(&self.rules, |rules| {
+            set_list(&mut rules.block, list.clone())
+        });
+    }
+
+    /// Removes the block list called `name`. Returns `false` when there was none.
+    pub fn remove_block_list(&self, name: &str) -> bool {
+        let mut removed = false;
+        update(&self.rules, |rules| {
+            removed = remove_list(&mut rules.block, name)
+        });
+        removed
+    }
+
+    /// Replaces the client IP resolver, e.g. after refreshing trusted proxy ranges.
+    pub fn set_resolver(&self, resolver: ClientIpResolver) {
+        update(&self.rules, |rules| rules.resolver = resolver.clone());
+    }
+
+    /// Changes [`IpFilter::default_deny`].
+    pub fn set_default_deny(&self, deny: bool) {
+        update(&self.rules, |rules| rules.default_deny = deny);
+    }
+}
+
+impl fmt::Debug for IpFilterHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IpFilterHandle").finish_non_exhaustive()
     }
 }
 
 /// The TCP peer address, from [`ConnectInfo`] or [`MockConnectInfo`].
-fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-    let extensions = req.extensions();
+fn peer_ip(extensions: &Extensions) -> Option<IpAddr> {
     extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr)
@@ -205,14 +380,28 @@ fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
         .map(|addr| addr.ip())
 }
 
+fn reject(rules: &Rules, rejection: Rejection) -> Response {
+    tracing::debug!(
+        ip = ?rejection.client_ip.map(|client_ip| client_ip.ip),
+        reason = %rejection.reason,
+        uri = %rejection.uri,
+        "request rejected by ip filter"
+    );
+    match &rules.on_block {
+        Some(handler) => handler(&rejection),
+        None => rejection.into_response(),
+    }
+}
+
 impl fmt::Debug for IpFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let config = &self.inner;
+        let rules = self.rules.load();
         f.debug_struct("IpFilter")
-            .field("resolver", &config.resolver)
-            .field("allow", &config.allow)
-            .field("block", &config.block)
-            .field("on_block", &config.on_block.is_some())
+            .field("resolver", &rules.resolver)
+            .field("allow", &rules.allow)
+            .field("block", &rules.block)
+            .field("default_deny", &rules.default_deny)
+            .field("on_block", &rules.on_block.is_some())
             .finish()
     }
 }
@@ -245,11 +434,14 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
-        let client_ip = self.filter.resolve(&req);
-        if let Err(reason) = self.filter.check(client_ip.map(|client_ip| client_ip.ip)) {
+        // One snapshot of the rules for the whole request.
+        let rules = self.filter.rules.load();
+        let client_ip = rules.resolve(req.headers(), req.extensions());
+        if let Err(reason) = rules.check(client_ip.map(|client_ip| client_ip.ip)) {
             let rejection = Rejection { client_ip, reason, uri: req.uri().clone() };
-            return Either::Left(future::ready(Ok(self.filter.reject(rejection))));
+            return Either::Left(future::ready(Ok(reject(&rules, rejection))));
         }
+        drop(rules);
         if let Some(client_ip) = client_ip {
             req.extensions_mut().insert(client_ip);
         }
@@ -275,7 +467,8 @@ pub struct Rejection {
 pub enum RejectReason {
     /// The IP is in the block list.
     Blocked,
-    /// The allow list is not empty and does not contain the IP.
+    /// The IP is in no allow list, and an allow list is set or
+    /// [`default_deny`](IpFilter::default_deny) is on.
     NotAllowed,
     /// No client IP could be resolved.
     Unresolved,

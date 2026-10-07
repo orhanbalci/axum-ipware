@@ -289,3 +289,138 @@ mod providers {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
+
+mod live_updates {
+    use std::net::IpAddr;
+
+    use axum_ipware::IpFilterHandle;
+
+    use super::*;
+
+    fn ranges(list: &[&str]) -> IpRanges {
+        IpRanges::parse(list).unwrap()
+    }
+
+    async fn status(router: &Router) -> StatusCode {
+        send(router.clone(), None).await.0
+    }
+
+    #[tokio::test]
+    async fn handle_changes_rules_of_running_router() {
+        let filter = IpFilter::new();
+        let handle = filter.handle();
+        let router = app(filter, Some("203.0.113.9"));
+        assert_eq!(status(&router).await, StatusCode::OK);
+
+        handle.set_block_list("abuse", ranges(&["203.0.113.0/24"]));
+        assert_eq!(status(&router).await, StatusCode::FORBIDDEN);
+
+        // Replacing the named list drops the old ranges.
+        handle.set_block_list("abuse", ranges(&["198.51.100.0/24"]));
+        assert_eq!(status(&router).await, StatusCode::OK);
+
+        handle.set_block_list("abuse", ranges(&["203.0.113.9"]));
+        assert!(handle.remove_block_list("abuse"));
+        assert!(!handle.remove_block_list("abuse"));
+        assert_eq!(status(&router).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn named_allow_lists_are_independent() {
+        let filter = IpFilter::new()
+            .allow_list("office", ranges(&["192.0.2.0/24"]))
+            .allow(["10.0.0.0/8"])
+            .unwrap();
+        let handle = filter.handle();
+        let office = app(filter.clone(), Some("192.0.2.7"));
+        let internal = app(filter, Some("10.1.2.3"));
+        assert_eq!(status(&office).await, StatusCode::OK);
+
+        handle.set_allow_list("office", ranges(&["198.51.100.0/24"]));
+        assert_eq!(status(&office).await, StatusCode::FORBIDDEN);
+        // The unnamed list is untouched.
+        assert_eq!(status(&internal).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn default_deny_until_first_list_arrives() {
+        let filter = IpFilter::new().default_deny(true);
+        let handle = filter.handle();
+        let router = app(filter, Some("192.0.2.7"));
+        assert_eq!(status(&router).await, StatusCode::FORBIDDEN);
+
+        handle.set_allow_list("office", ranges(&["192.0.2.0/24"]));
+        assert_eq!(status(&router).await, StatusCode::OK);
+
+        handle.set_default_deny(false);
+        assert!(handle.remove_allow_list("office"));
+        assert_eq!(status(&router).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn set_resolver_live() {
+        let filter = IpFilter::new();
+        let handle = filter.handle();
+        let router = app(filter, Some("10.0.0.2"));
+        let (_, body) = send(router.clone(), Some("93.184.216.34")).await;
+        assert_eq!(body, "peer 10.0.0.2");
+
+        handle.set_resolver(behind_proxy());
+        let (_, body) = send(router, Some("93.184.216.34")).await;
+        assert_eq!(body, "header 93.184.216.34 true");
+    }
+
+    #[tokio::test]
+    async fn clones_share_rules() {
+        let filter = IpFilter::new();
+        let router = app(filter.clone(), Some("203.0.113.9"));
+        let _ = filter.block(["203.0.113.9"]).unwrap();
+        assert_eq!(status(&router).await, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn check_and_resolve_parts() {
+        let filter = IpFilter::new()
+            .allow(["10.0.0.0/8"])
+            .unwrap()
+            .block(["10.0.0.13"])
+            .unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(filter.check(ip("10.1.2.3")), Ok(()));
+        assert_eq!(filter.check(ip("10.0.0.13")), Err(RejectReason::Blocked));
+        assert_eq!(filter.check(ip("192.0.2.1")), Err(RejectReason::NotAllowed));
+        assert_eq!(filter.check(ip("::ffff:10.1.2.3")), Ok(()));
+
+        let (parts, ()) = Request::builder()
+            .extension(MockConnectInfo(SocketAddr::new(ip("10.1.2.3"), 4000)))
+            .body(())
+            .unwrap()
+            .into_parts();
+        let client_ip = filter.resolve_parts(&parts).unwrap();
+        assert_eq!(client_ip.ip, ip("10.1.2.3"));
+        assert_eq!(client_ip.source, IpSource::Peer);
+    }
+
+    #[tokio::test]
+    async fn updates_during_concurrent_requests() {
+        let filter = IpFilter::new();
+        let handle: IpFilterHandle = filter.handle();
+        let router = app(filter, Some("203.0.113.9"));
+        let requests = (0..200).map(|_| {
+            let router = router.clone();
+            tokio::spawn(async move { send(router, None).await.0 })
+        });
+        let requests: Vec<_> = requests.collect();
+        for i in 0..200 {
+            if i % 2 == 0 {
+                handle.set_block_list("flip", ranges(&["203.0.113.9"]));
+            } else {
+                handle.remove_block_list("flip");
+            }
+        }
+        for request in requests {
+            let status = request.await.unwrap();
+            assert!(status == StatusCode::OK || status == StatusCode::FORBIDDEN);
+        }
+    }
+}

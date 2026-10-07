@@ -107,6 +107,31 @@ The built-in ranges are snapshots; see
 their date and for parsers to load fresh lists, which you can pass to
 [`IpFilter::allow_ranges`] and [`IpFilter::block_ranges`].
 
+### 🔄 Live updates
+
+Rules can change while the server runs. [`IpFilter::handle`] returns an
+[`IpFilterHandle`] that replaces named allow and block lists, the resolver, or
+the default policy; each change applies atomically to new requests.
+
+```rust
+use axum_ipware::ipware::IpRanges;
+use axum_ipware::IpFilter;
+
+// Reject everything until the first allow list arrives.
+let filter = IpFilter::new().default_deny(true);
+let handle = filter.handle();
+// ... add `filter` to the router and start the server ...
+
+// From a background task, e.g. after downloading a list:
+handle.set_allow_list("office", IpRanges::parse(["192.0.2.0/24"]).unwrap());
+handle.set_block_list("abuse", IpRanges::parse(["203.0.113.0/24"]).unwrap());
+handle.remove_block_list("abuse");
+```
+
+Outside the middleware, [`IpFilter::check`] tests an IP against the current
+rules, and [`IpFilter::resolve`] / [`IpFilter::resolve_parts`] resolve a
+request's client IP.
+
 ### 🛑 Custom rejections
 
 ```rust

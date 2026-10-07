@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ranges or lists fetched at startup. An empty allow set rejects every request.
 - `providers` feature: ipware's platform presets (Cloudflare, CloudFront,
   Fastly, Google Cloud load balancers, Fly.io) and webhook ranges.
+- Live updates: `IpFilter::handle` returns an `IpFilterHandle` that replaces or
+  removes named allow and block lists (`allow_list` / `block_list`), the
+  resolver, and the default policy while the server runs. Rules are swapped
+  atomically and read lock-free; clones of a filter share them.
+- `default_deny` to reject IPs outside the allow lists even before any list is set.
+- `IpFilter::check`, `resolve` and `resolve_parts` for use outside the middleware.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.
