@@ -422,8 +422,7 @@ pub use filter::{
     RejectReason,
     Rejection,
 };
-pub use ipware;
-pub use ipware::IpSource;
+pub use ipware::{self, IpSource};
 #[cfg(feature = "glob")]
 pub use rules::PatternError;
 pub use rules::{parse_rules, Action, Rule, RuleParseError};
