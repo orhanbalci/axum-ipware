@@ -58,7 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after errors and plain HTTP only for loopback hosts unless allowed.
 - `Safeguards::allow_empty` for sources where an empty list is normal.
 - `ClientIp` extractor (also as `Option<ClientIp>`) with the address source.
+- `ClientOrigin` extractor with the scheme and host the client requested, read
+  from `Forwarded` or `X-Forwarded-Proto` / `X-Forwarded-Host` only for trusted
+  proxies.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.
 
-Requires ipware 0.5 with `IpRanges` address counts (from git until the next ipware release).
+Requires ipware 0.5 with `IpRanges` address counts and `forwarded_origin` (from git until the next ipware release).

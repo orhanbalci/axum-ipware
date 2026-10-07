@@ -82,3 +82,46 @@ impl IntoResponse for MissingClientIp {
         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
     }
 }
+
+/// The scheme and host the client originally requested, as reported by a
+/// trusted proxy through `Forwarded` or `X-Forwarded-Proto` / `X-Forwarded-Host`.
+///
+/// [`IpFilter`](crate::IpFilter) sets it for every request it lets through. The
+/// fields are `None` when the request did not come from a trusted proxy, the
+/// headers are missing, or their values are invalid; fall back to the request's
+/// own URI and `Host` header then.
+///
+/// ```rust
+/// use axum_ipware::ClientOrigin;
+///
+/// async fn handler(origin: ClientOrigin) -> String {
+///     let scheme = origin.scheme.as_deref().unwrap_or("http");
+///     format!("requested over {scheme}")
+/// }
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ClientOrigin {
+    /// `http`, `https`, `ws` or `wss`.
+    pub scheme: Option<String>,
+    /// The host, with an optional port, lowercase.
+    pub host: Option<String>,
+}
+
+impl From<ipware::ForwardedOrigin> for ClientOrigin {
+    fn from(origin: ipware::ForwardedOrigin) -> Self {
+        ClientOrigin { scheme: origin.scheme, host: origin.host }
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientOrigin {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ClientOrigin>()
+            .cloned()
+            .unwrap_or_default())
+    }
+}

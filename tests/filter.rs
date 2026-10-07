@@ -565,3 +565,60 @@ mod filter_api {
         assert_eq!(status(&rules, "172.17.5.5").await, StatusCode::OK);
     }
 }
+
+mod client_origin {
+    use axum_ipware::ClientOrigin;
+
+    use super::*;
+
+    async fn origin(origin: ClientOrigin) -> String {
+        format!(
+            "{} {}",
+            origin.scheme.unwrap_or_default(),
+            origin.host.unwrap_or_default()
+        )
+    }
+
+    async fn request(router: Router, peer: Option<&str>) -> String {
+        let req = Request::builder()
+            .uri("/")
+            .header("x-forwarded-proto", "https")
+            .header("forwarded", "for=93.184.216.34;host=App.Example.com");
+        let router = match peer {
+            Some(peer) => router.layer(MockConnectInfo(SocketAddr::new(
+                peer.parse().unwrap(),
+                4000,
+            ))),
+            None => router,
+        };
+        let res = router
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn from_trusted_proxy() {
+        let router = Router::new()
+            .route("/", get(origin))
+            .layer(IpFilter::new().resolver(behind_proxy()));
+        assert_eq!(
+            request(router, Some("10.0.0.2")).await,
+            "https app.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignored_from_direct_clients_and_without_filter() {
+        let router = Router::new()
+            .route("/", get(origin))
+            .layer(IpFilter::new().resolver(behind_proxy()));
+        assert_eq!(request(router, Some("198.51.100.1")).await, " ");
+        let without_filter = Router::new().route("/", get(origin));
+        assert_eq!(request(without_filter, Some("10.0.0.2")).await, " ");
+    }
+}

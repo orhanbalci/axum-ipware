@@ -90,6 +90,10 @@
 //! # }
 //! ```
 //!
+//! Behind a trusted proxy, the [`ClientOrigin`] extractor also gives the scheme
+//! and host the client requested, from `Forwarded` or `X-Forwarded-Proto` /
+//! `X-Forwarded-Host`; direct clients cannot set them.
+//!
 //! [`ClientIpStrategy`] also covers a fixed proxy count,
 //! the rightmost public address, single-IP CDN headers such as `CF-Connecting-IP`,
 //! RFC 7239 `Forwarded`, ipware's own header lookup, and chains of these. Without a
@@ -390,6 +394,7 @@
 //! [`IpFilter::handle`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.handle
 //! [`IpFilter::resolve`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.resolve
 //! [`IpFilter::resolve_parts`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilter.html#method.resolve_parts
+//! [`ClientOrigin`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.ClientOrigin.html
 //! [`IpFilterHandle`]: https://docs.rs/axum-ipware/latest/axum_ipware/struct.IpFilterHandle.html
 //! [`refresh::Refresh`]: https://docs.rs/axum-ipware/latest/axum_ipware/refresh/struct.Refresh.html
 
@@ -407,7 +412,7 @@ pub mod governor;
 pub mod refresh;
 mod rules;
 
-pub use client_ip::{ClientIp, MissingClientIp};
+pub use client_ip::{ClientIp, ClientOrigin, MissingClientIp};
 pub use filter::{
     Allowed,
     FilterStats,

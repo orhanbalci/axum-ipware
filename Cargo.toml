@@ -34,7 +34,7 @@ fetch = ["refresh", "dep:reqwest"]
 arc-swap = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
-ipware = { version = "0.5", git = "https://github.com/orhanbalci/ipware.git", rev = "cfc6a6685b944b0463927f18755914d94ad22939" }
+ipware = { version = "0.5", git = "https://github.com/orhanbalci/ipware.git", rev = "51a515c6759751f27c17cf123dd212e6c80cab3b" }
 maxminddb = { version = "0.32", optional = true }
 pin-project-lite = { version = "0.2", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }

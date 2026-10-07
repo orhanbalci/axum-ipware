@@ -16,7 +16,7 @@ use ipware::{ClientIpResolver, IpRangeError, IpRanges};
 use tower_layer::Layer;
 use tower_service::Service;
 
-use crate::client_ip::ClientIp;
+use crate::client_ip::{ClientIp, ClientOrigin};
 use crate::rules::{Action, MatchContext, Matcher, Rule};
 
 type BlockHandler = Arc<dyn Fn(&Rejection) -> Response + Send + Sync>;
@@ -619,6 +619,10 @@ where
         if let Some(handler) = &rules.on_allow {
             handler(&Allowed { client_ip, method: req.method(), uri: req.uri() });
         }
+        let origin = rules
+            .resolver
+            .forwarded_origin(req.headers(), peer_ip(req.extensions()));
+        req.extensions_mut().insert(ClientOrigin::from(origin));
         drop(rules);
         if let Some(client_ip) = client_ip {
             req.extensions_mut().insert(client_ip);
