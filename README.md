@@ -340,6 +340,23 @@ the source admit more addresses, so only do it for sources you trust.
 The `fetch` feature's dependencies need MSRV-aware dependency resolution on Rust
 older than 1.88, which is the default for projects on the 2024 edition.
 
+### 🧪 Examples
+
+Runnable examples live in the
+[`examples`](https://github.com/orhanbalci/axum-ipware/tree/main/examples)
+directory; each starts a server on `127.0.0.1:3000` and lists `curl` commands
+to try in its header.
+
+| Example | Shows | Run with |
+| --- | --- | --- |
+| `basic` | an allow list and the `ClientIp` extractor | `cargo run --example basic` |
+| `behind_proxy` | trusted proxies, spoofed headers, `ClientOrigin` | `cargo run --example behind_proxy` |
+| `live_updates` | blocking at runtime from admin endpoints, stats | `cargo run --example live_updates` |
+| `refresh` | the Tor exit list, refreshed hourly | `cargo run --example refresh --features fetch` |
+| `rate_limit` | tower_governor and automatic bans | `cargo run --example rate_limit --features governor,autoban` |
+| `geo` | country and ASN rules | `cargo run --example geo --features geo` |
+| `crowdsec` | a CrowdSec bouncer | `cargo run --example crowdsec --features crowdsec` |
+
 ### 🛑 Custom rejections
 
 ```rust

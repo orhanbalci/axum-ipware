@@ -49,6 +49,23 @@ tracing = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.docs.rs]
 all-features = true
+
+[[example]]
+name = "refresh"
+required-features = ["fetch"]
+
+[[example]]
+name = "rate_limit"
+required-features = ["governor", "autoban"]
+
+[[example]]
+name = "geo"
+required-features = ["geo"]
+
+[[example]]
+name = "crowdsec"
+required-features = ["crowdsec"]

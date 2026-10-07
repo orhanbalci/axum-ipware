@@ -63,5 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxies.
 - Custom rejection responses via `on_block`; `403 Forbidden` by default.
 - IPv4-mapped IPv6 addresses are matched as IPv4.
+- Runnable examples: `basic`, `behind_proxy`, `live_updates`, `refresh`,
+  `rate_limit`, `geo` and `crowdsec`.
 
 Requires ipware 0.5 with `IpRanges` address counts and `forwarded_origin` (from git until the next ipware release).
