@@ -15,7 +15,7 @@ readme = "README.md"
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false }
 ipnet = "2.9"
-ipware = "0.4"
+ipware = { version = "0.4", git = "https://github.com/orhanbalci/ipware.git", rev = "53e16181694c2af1033146e007137838ce3e99fe" }
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"

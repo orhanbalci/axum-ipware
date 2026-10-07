@@ -174,6 +174,19 @@ async fn rules_apply_to_header_ip_from_trusted_proxy() {
 }
 
 #[tokio::test]
+async fn private_client_behind_trusted_proxy() {
+    let filter = IpFilter::new()
+        .ipware(proxied(1))
+        .trusted_proxies(["10.0.0.2"])
+        .unwrap()
+        .allow(["10.1.0.0/16"])
+        .unwrap();
+    let (status, body) = send(app(filter, Some("10.0.0.2")), Some("10.1.2.3, 10.0.0.2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "header 10.1.2.3 true");
+}
+
+#[tokio::test]
 async fn ipv4_mapped_peer_matches_trusted_proxies() {
     let filter = IpFilter::new()
         .ipware(proxied(1))
