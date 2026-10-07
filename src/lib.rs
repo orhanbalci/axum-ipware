@@ -71,6 +71,35 @@
 //! Requests from any other peer use the peer address, so a client that reaches the
 //! app directly cannot bypass the rules by sending its own headers.
 //!
+//! ## 🧭 Choosing a source
+//!
+//! [`ClientIpSource`] picks how the client IP is read once the peer is trusted:
+//!
+//! | Source | Use when |
+//! | --- | --- |
+//! | `Ipware` (default) | ipware's header lookup with its proxy count or proxy list |
+//! | `RightmostTrustedRange(header)` | your proxies' ranges are known; skips them from the right |
+//! | `RightmostTrustedCount(header, n)` | a fixed number of proxies sit in front of the app |
+//! | `RightmostNonPrivate(header)` | proxies are on private networks, clients are on the internet |
+//! | `SingleHeader(header)` | a CDN sets one header, such as `CF-Connecting-IP` |
+//! | `ConnectInfo` | there is no proxy |
+//! | `Chain(sources)` | try several sources in order |
+//!
+//! ```rust
+//! use axum_ipware::{header, ClientIpSource, IpFilter};
+//!
+//! # fn main() -> Result<(), axum_ipware::RuleError> {
+//! let filter = IpFilter::new()
+//!     .trust_private(true)
+//!     .source(ClientIpSource::RightmostTrustedRange(header::X_FORWARDED_FOR))
+//!     .max_forwarded_hops(10);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Rightmost sources read `X-Forwarded-For` lists and RFC 7239 `Forwarded`
+//! headers, and stop at the first entry they cannot parse.
+//!
 //! ## 🛑 Custom rejections
 //!
 //! ```rust
@@ -93,9 +122,12 @@
 
 mod client_ip;
 mod filter;
+pub mod header;
 mod rules;
+mod source;
 
 pub use client_ip::{ClientIp, IpSource, MissingClientIp};
 pub use filter::{IpFilter, IpFilterService, RejectReason, Rejection};
 pub use ipware;
 pub use rules::RuleError;
+pub use source::ClientIpSource;

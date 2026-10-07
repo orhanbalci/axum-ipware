@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ClientIpSource` to choose how the client IP is read: `ConnectInfo`, `Ipware`
+  (default), `SingleHeader`, `RightmostNonPrivate`, `RightmostTrustedCount`,
+  `RightmostTrustedRange`, and `Chain`.
+- RFC 7239 `Forwarded` header parsing; `X-Forwarded-For` entries with ports,
+  brackets, quotes and IPv6 zones; multiple header lines are combined.
+- `trust_loopback`, `trust_private`, and `trust_link_local` switches for trusted proxies.
+- `max_forwarded_hops` to limit how far the rightmost sources walk.
+- `header` module with common client IP header names.
+
 - `IpFilter` tower layer: resolves the client IP with ipware, falls back to the
   `ConnectInfo` peer address, and applies allow/block rules.
 - IP address and CIDR rules for IPv4 and IPv6; block rules win over allow rules.

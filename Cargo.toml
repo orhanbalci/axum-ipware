@@ -2,7 +2,7 @@
 name = "axum-ipware"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.85"
 description = "Client IP extraction and IP allow/block filtering middleware for axum, powered by ipware"
 repository = "https://github.com/orhanbalci/axum-ipware"
 homepage = "https://github.com/orhanbalci"
